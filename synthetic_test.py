@@ -1,5 +1,5 @@
 #!/usr/bin/env
-
+import os
 import sys
 sys.path.append("./SMCMTI")
 
@@ -105,17 +105,17 @@ def run(
     # Select which coverage scenario to use
     #==============================================================================
     
-    # azimuth = good_azimuth
-    # takeoff = good_takeoff
-    azimuth = moderate_azimuth
-    takeoff = moderate_takeoff
+    azimuth = good_azimuth
+    takeoff = good_takeoff
+    # azimuth = moderate_azimuth
+    # takeoff = moderate_takeoff
     # azimuth = low_azimuth
     # takeoff = low_takeoff
 
 
     inversion_options = [
         'PPolarity',
-        'SHPolarity',
+        # 'SHPolarity',
         # 'SVPolarity',
         'P/SHAmplitudeRatio',
         'P/SVAmplitudeRatio',

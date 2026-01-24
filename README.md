@@ -19,21 +19,23 @@ Traditional MT inversion methods often struggle with non-linear parameter spaces
 
 ## 📦 Installation
 
-Ensure you have [Pixi](https://pixi.sh) installed. SMTI uses Pixi to manage its environment and dependencies (including C++ compilers and BLAS/LAPACK for PyTensor).
-
-### Setup with Pixi (Recommended)
+Clone the repository:
 ```bash
-pixi init
-pixi add python=3.11 numpy=1.26.4 pymc=5.24.1 arviz=0.21.0 matplotlib=3.10.5 scipy=1.15.2 pandas=2.2.3 scikit-learn
-pixi add --pypi pyrocko==2025.1.21
+git clone https://github.com/amd-mohamadi/SMTI.git
+cd SMTI
 ```
 
-### Setup with Conda
-If you prefer Conda, you can create an environment manually:
+### Option 1: Pixi (Recommended)
+[Pixi](https://pixi.sh) provides fast, reproducible environments. Once installed, simply run:
 ```bash
-conda create -n smti python=3.11
+pixi install
+pixi run python synthetic_test.py
+```
+
+### Option 2: Conda
+```bash
+conda env create -f environment.yml
 conda activate smti
-pip install pymc==5.24.1 arviz==0.21.0 matplotlib==3.10.5 pyrocko==2025.1.21 numpy==1.26.4 scipy==1.15.2 pandas==2.2.3
 ```
 
 ## 🛠️ Quick Start
@@ -81,24 +83,24 @@ print(f"Posterior MT6 Mean:\n{result.mt6.mean(axis=1)}")
 - `synthetic_test.py`: Top-level script for benchmarking and visualization.
 - `example_data.py`: Pre-formatted datasets for testing.
 
-<!-- ## 📊 Outputs & Visualization
-
-SMTI automatically generates a variety of diagnostic and scientific plots. Here are examples from a synthetic FORGE inversion:
-
-<p align="center">
-  <img src="synthetic_test/forge_1111911135_PPolarity_SHPolarity_PSHAmplitudeRatio_PSVAmplitudeRatio_mt/fault_planes_hdi90.png" width="30%" />
-  <img src="synthetic_test/forge_1111911135_PPolarity_SHPolarity_PSHAmplitudeRatio_PSVAmplitudeRatio_mt/kaverina_hdi_90.png" width="30%" />
-  <img src="synthetic_test/forge_1111911135_PPolarity_SHPolarity_PSHAmplitudeRatio_PSVAmplitudeRatio_mt/hudson_hdi_90.png" width="30%" />
-</p>
-
-*Left: Fault plane distribution (90% HDI). Center: Kaverina diagram. Right: Hudson plot.*
-
-- **Hudson & Kaverina Diagrams**: With 90% HDI (Highest Density Interval) contours.
-- **Beachballs**: Median and MAP (mode) solutions with station overlays.
-- **Posterior Summaries**: Pairwise distribution of Tape parameters using ArviZ. -->
-
 ## ⚠️ Status
 This is an experimental research code. API stability is not guaranteed. 
+
+## 🙏 Acknowledgements
+
+This project builds upon and is heavily inspired by [**MTfit**](https://github.com/djpugh/MTfit) by David J. Pugh. Key components derived from MTfit include:
+- **Tape parameterization**: Moment tensor conversions using the Tape & Tape formulation.
+- **Plotting utilities**: Beachball, and fault plane.
+- **Forward modeling**: Radiation pattern calculations for P, SH, and SV phases.
+
+We gratefully acknowledge the MTfit project for providing a solid foundation for seismic moment tensor analysis.
+
+## 📖 Citation
+
+If you use SMTI in your research, please also cite the original MTfit paper:
+
+> Pugh, D.J. and White, R.S., 2018. MTfit: A Bayesian approach to seismic moment tensor inversion. *Seismological Research Letters*, 89(4), pp.1507-1513. [https://doi.org/10.1785/0220170258](https://doi.org/10.1785/0220170258)
+
 
 ---
 Developed by **Ahmad Mohamadi**.

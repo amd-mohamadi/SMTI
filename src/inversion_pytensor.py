@@ -22,7 +22,6 @@ import numpy as np
 import pymc as pm
 import pytensor.tensor as pt
 import arviz as az
-from joblib import Parallel, delayed
 
 from .data_prep import (
     amplitude_matrix,
