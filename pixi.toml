@@ -1,0 +1,19 @@
+[workspace]
+authors = ["Ahmad Mohamadi <mohamadi.ad68@gmail.com>"]
+channels = ["pyrocko", "conda-forge"]
+name = "SMCMTI"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.11.*"
+numpy = "1.26.4.*"
+pymc = "5.24.1.*"
+arviz = "0.21.0.*"
+matplotlib = "3.10.5.*"
+scipy = "1.15.2.*"
+pandas = "2.2.3.*"
+scikit-learn = ">=1.8.0,<2"
+pyrocko = ">=2025.12.4,<2026"

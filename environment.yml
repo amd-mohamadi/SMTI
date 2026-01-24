@@ -1,0 +1,22 @@
+name: smti
+channels:
+  - pyrocko
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy=1.26.4
+  - pymc=5.24.1
+  - pytensor=2.23.0
+  - arviz=0.21.0
+  - matplotlib=3.10.5
+  - scipy=1.15.2
+  - pandas=2.2.3
+  - scikit-learn=1.7.1
+  - pyrocko=2025.01.21
+  - numba
+  - h5py
+  - xarray
+  - seaborn
+  - tqdm
+  - joblib
+  - ipykernel
