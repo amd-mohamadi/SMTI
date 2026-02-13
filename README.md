@@ -139,10 +139,6 @@ This is an experimental research code. API stability is not guaranteed.
 - **PyTensor backend**: Best for CPU-based workloads. Scales well with `chains` parameter (multi-core parallelization).
 - **BlackJAX backend**: Best for GPU-accelerated workloads. Typically 10-100x faster than CPU for large particle counts (≥2000 particles). Requires CUDA-enabled GPU.
 
-### Known Limitations
-- BlackJAX backend does not support absolute amplitude observations (only polarities and amplitude ratios).
-- BlackJAX results may require post-inversion polarity sign alignment (handled automatically in `cape_inversion_blackjax.py`). 
-
 ## 🙏 Acknowledgements
 
 This project builds upon and is heavily inspired by [**MTfit**](https://github.com/djpugh/MTfit) by David J. Pugh. Key components derived from MTfit include:
