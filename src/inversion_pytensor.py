@@ -257,29 +257,24 @@ class InversionPyTensor:
 
             # Prepare polarity data
             if has_pol:
-                a_polarity, error_polarity, incorrect_polarity_prob = polarity_matrix(
+                a_pol_arr, error_polarity, incorrect_polarity_prob = polarity_matrix(
                     filtered, location_samples=location_samples
                 )
-                a_pol_arr = np.asarray(a_polarity, dtype=float)
-                if a_pol_arr.ndim != 3:
+                a_pol_np = np.asarray(a_pol_arr, dtype="float64")
+                if a_pol_np.ndim != 3:
                     raise RuntimeError(
                         "Polarity matrix is expected to have shape "
                         "(N_obs, N_loc_samples, 6)."
                     )
-                n_pol_obs, n_loc_samples_pol, _ = a_pol_arr.shape
-                # Flatten location samples so each (obs, location) pair becomes
-                # an independent row, mirroring the NumPy likelihood behaviour.
-                a_pol_np = a_pol_arr.reshape(n_pol_obs * n_loc_samples_pol, 6)
+                # Shape: (N_obs, N_loc_samples, 6)
+                # We KEEP this 3D shape for marginalization.
 
-                error_pol_np = np.asarray(error_polarity, dtype=float).reshape(-1)
-                if error_pol_np.size != n_pol_obs:
+                error_pol_np = np.asarray(error_polarity, dtype="float64").reshape(-1)
+                n_pol_obs = error_pol_np.size
+                if n_pol_obs != a_pol_np.shape[0]:
                     raise RuntimeError(
                         "Polarity error length does not match number of observations."
                     )
-                if n_loc_samples_pol > 1:
-                    error_pol_flat = np.repeat(error_pol_np, n_loc_samples_pol)
-                else:
-                    error_pol_flat = error_pol_np
 
                 # Get observed polarities (sign of amplitude, 0=down,1=up)
                 pol_obs_base = self._extract_polarity_observations(filtered)
@@ -287,29 +282,24 @@ class InversionPyTensor:
                     raise RuntimeError(
                         "Number of polarity observations does not match angle matrix."
                     )
-                if n_loc_samples_pol > 1:
-                    pol_observations = np.repeat(pol_obs_base, n_loc_samples_pol)
-                else:
-                    pol_observations = pol_obs_base
+                
+                # Unlike before, we do NOT repeat observations.
+                # pol_observations shape: (N_obs,)
+                pol_observations = pol_obs_base
 
                 if isinstance(incorrect_polarity_prob, (float, int)):
-                    incorrect_prob = incorrect_polarity_prob
+                    incorrect_prob = float(incorrect_polarity_prob)
                 else:
-                    inc_np = np.asarray(incorrect_polarity_prob, dtype=float).reshape(-1)
-                    if inc_np.size != n_pol_obs:
+                    incorrect_prob = np.asarray(incorrect_polarity_prob, dtype="float64").flatten()
+                    if incorrect_prob.size != n_pol_obs:
                         raise RuntimeError(
                             "IncorrectPolarityProbability length does not match "
                             "number of observations."
                         )
-                    incorrect_prob = (
-                        np.repeat(inc_np, n_loc_samples_pol)
-                        if n_loc_samples_pol > 1
-                        else inc_np
-                    )
 
             else:
                 a_pol_np = None
-                error_pol_flat = None
+                error_pol_np = None
                 pol_observations = None
                 incorrect_prob = 0.0
 
@@ -321,18 +311,19 @@ class InversionPyTensor:
                     perc_err_amp,
                 ) = amplitude_matrix(filtered, location_samples=location_samples)
 
-                a_amp_arr = np.asarray(a_amp, dtype=float)
-                if a_amp_arr.ndim != 3:
+                a_amp_np = np.asarray(a_amp, dtype="float64")
+                if a_amp_np.ndim != 3:
                     raise RuntimeError(
                         "Amplitude matrices are expected to have shape "
                         "(N_obs, N_loc_samples, 6)."
                     )
-                n_amp_obs, n_loc_samples_amp, _ = a_amp_arr.shape
-                a_amp_np = a_amp_arr.reshape(n_amp_obs * n_loc_samples_amp, 6)
+                # Shape: (N_obs, N_loc_samples, 6)
 
-                amp_base = np.asarray(amplitude_amp, dtype=float).reshape(-1)
-                perc_err_amp_np = np.asarray(perc_err_amp, dtype=float).reshape(-1)
-                if amp_base.size != n_amp_obs or perc_err_amp_np.size != n_amp_obs:
+                amp_base = np.asarray(amplitude_amp, dtype="float64").reshape(-1)
+                perc_err_amp_np = np.asarray(perc_err_amp, dtype="float64").reshape(-1)
+                n_amp_obs = amp_base.size
+
+                if a_amp_np.shape[0] != n_amp_obs:
                     raise RuntimeError(
                         "Amplitude arrays do not match number of observations."
                     )
@@ -341,12 +332,9 @@ class InversionPyTensor:
                 log_amp_sigma_base = np.abs(perc_err_amp_np)
                 self.last_log_amp_sigma_base = log_amp_sigma_base.copy()
 
-                if n_loc_samples_amp > 1:
-                    amp_obs = np.repeat(amp_base, n_loc_samples_amp)
-                    log_amp_sigma = np.repeat(log_amp_sigma_base, n_loc_samples_amp)
-                else:
-                    amp_obs = amp_base
-                    log_amp_sigma = log_amp_sigma_base
+                # Keep observations as (N_obs,)
+                amp_obs = amp_base
+                log_amp_sigma = log_amp_sigma_base
             else:
                 a_amp_np = None
                 amp_obs = None
@@ -363,43 +351,32 @@ class InversionPyTensor:
                     perc_err2,
                 ) = amplitude_ratio_matrix(filtered, location_samples=location_samples)
 
-                a1_arr = np.asarray(a1_ar, dtype=float)
-                a2_arr = np.asarray(a2_ar, dtype=float)
-                if a1_arr.ndim != 3 or a2_arr.ndim != 3:
+                a1_ar_np = np.asarray(a1_ar, dtype="float64")
+                a2_ar_np = np.asarray(a2_ar, dtype="float64")
+                if a1_ar_np.ndim != 3 or a2_ar_np.ndim != 3:
                     raise RuntimeError(
                         "Amplitude-ratio matrices are expected to have shape "
                         "(N_obs, N_loc_samples, 6)."
                     )
-                n_ar_obs, n_loc_samples_ar, _ = a1_arr.shape
-                a1_ar_np = a1_arr.reshape(n_ar_obs * n_loc_samples_ar, 6)
-                a2_ar_np = a2_arr.reshape(n_ar_obs * n_loc_samples_ar, 6)
+                # Shape: (N_obs, N_loc_samples, 6)
 
-                amp_ratio_base = np.asarray(amplitude_ratio, dtype=float).reshape(-1)
-                perc_err1_np = np.asarray(perc_err1, dtype=float).reshape(-1)
-                perc_err2_np = np.asarray(perc_err2, dtype=float).reshape(-1)
-                if (
-                    amp_ratio_base.size != n_ar_obs
-                    or perc_err1_np.size != n_ar_obs
-                    or perc_err2_np.size != n_ar_obs
-                ):
+                amp_ratio_base = np.asarray(amplitude_ratio, dtype="float64").reshape(-1)
+                perc_err1_np = np.asarray(perc_err1, dtype="float64").reshape(-1)
+                perc_err2_np = np.asarray(perc_err2, dtype="float64").reshape(-1)
+                n_ar_obs = amp_ratio_base.size
+
+                if a1_ar_np.shape[0] != n_ar_obs:
                     raise RuntimeError(
                         "Amplitude-ratio arrays do not match number of observations."
                     )
 
                 # Combined error for log-ratio (per observation)
-                # For LogNormal, we need sigma in log-space
-                # Approximate from percentage errors
                 log_ratio_sigma_base = np.sqrt(perc_err1_np**2 + perc_err2_np**2)
-                # Expose per-observation log-ratio uncertainties for debugging.
                 self.last_log_ratio_sigma_base = log_ratio_sigma_base.copy()
-                if n_loc_samples_ar > 1:
-                    amp_ratio_obs = np.repeat(amp_ratio_base, n_loc_samples_ar)
-                    log_ratio_sigma = np.repeat(
-                        log_ratio_sigma_base, n_loc_samples_ar
-                    )
-                else:
-                    amp_ratio_obs = amp_ratio_base
-                    log_ratio_sigma = log_ratio_sigma_base
+
+                # Keep observations as (N_obs,)
+                amp_ratio_obs = amp_ratio_base
+                log_ratio_sigma = log_ratio_sigma_base
 
             else:
                 a1_ar_np = a2_ar_np = None
@@ -442,94 +419,160 @@ class InversionPyTensor:
                 # ===== Forward Model (Pure PyTensor) =====
                 mt6 = pt_Tape_MT6(gamma, delta, kappa, h, sigma_tape)
 
-                # ===== Polarity Likelihood =====
+                # ===== Polarity Likelihood (Marginalized) =====
                 if has_pol and pol_observations is not None:
-                    # Predicted signed amplitude for each (observation, location) pair.
-                    # a_pol_np already includes the measured sign (see polarity_matrix),
-                    # so X_pol = d_i * (g_i · mt6), where d_i ∈ {+1, -1} is the observed polarity.
-                    X_pol = pt.dot(pt.as_tensor(a_pol_np), mt6)
+                    # a_pol_np: (N_obs, N_loc_samp, 6)
+                    # mt6: (6,)
+                    # Result X_pol: (N_obs, N_loc_samp)
+                    X_pol = pt.tensordot(pt.as_tensor(a_pol_np), mt6, axes=[[2], [0]])
 
-                    # Recover geometry-only amplitude μ_i = g_i · mt6 from X_pol and the
-                    # observed polarity sign d_i (encoded as 0/1 in pol_observations).
-                    pol_obs_np = pol_observations.astype("float64")
-                    sign_obs_np = 2.0 * pol_obs_np - 1.0  # {0,1} -> {-1,+1}
-                    sign_obs = pt.as_tensor(sign_obs_np)
-                    mu_geom = sign_obs * X_pol
-
-                    # Measurement uncertainty per observation (avoid zero variance).
-                    sigma_pol = pt.as_tensor(error_pol_flat.reshape(-1))
+                    # Recover geometry-only amplitude μ_i = g_i · mt6
+                    pol_obs_np = pol_observations.astype("float64")  # (N_obs,)
+                    
+                    # Measurement uncertainty (N_obs,)
+                    sigma_pol = pt.as_tensor(error_pol_np)
                     sigma_pol = pt.maximum(sigma_pol, _SMALL_NUMBER)
-
-                    # Base probability that the true polarity is "up":
-                    # f_i = Φ(μ_i / σ_i)
-                    base_prob = 0.5 * (
-                        1.0 + pt.erf(mu_geom / (pt.sqrt(2.0) * sigma_pol))
-                    )
-
-                    # Incorrect-polarity probability (scalar or per-observation array).
+                    
+                    # Incorrect polarity probability (scalar or N_obs,)
                     if isinstance(incorrect_prob, (float, int)):
-                        inc_tensor = pt.as_tensor(
-                            np.array(incorrect_prob, dtype="float64")
-                        )
+                        inc_tensor = pt.as_tensor(float(incorrect_prob))
                     else:
-                        inc_tensor = pt.as_tensor(
-                            np.asarray(incorrect_prob, dtype=float).reshape(-1)
-                        )
+                        inc_tensor = pt.as_tensor(incorrect_prob)
+                    
+                    # Expand dimensions for broadcasting across location samples
+                    # (N_obs, 1) to match (N_obs, N_loc_samp)
+                    sigma_pol_bc = sigma_pol.dimshuffle(0, "x")
+                    if inc_tensor.ndim > 0:
+                        inc_tensor_bc = inc_tensor.dimshuffle(0, "x")
+                    else:
+                        inc_tensor_bc = inc_tensor
 
-                    # Final probability that the observed polarity is "up" (1):
-                    # p_up = inc + (1 - 2*inc) * Φ(μ / σ)
-                    p_up = inc_tensor + (1.0 - 2.0 * inc_tensor) * base_prob
+                    # Polarity probability logic:
+                    # We compute P("up" | MT, Loc_j) for each location sample j.
+                    # Since X_pol is the signed amplitude (already multiplied by observed sign in a_pol_np?), 
+                    # Wait, a_pol_np comes from `polarity_matrix` which multiplies by `measured`.
+                    # So X_pol > 0 means "Agreement with observation".
+                    #
+                    # The probability that the observation is correct (matches sign of X_pol) is:
+                    # P(match) = Φ( |X_pol| / σ ) ???
+                    #
+                    # Let's revert to the standard definition used in standard PyMC:
+                    # The code previously calculated mu_geom = sign_obs * X_pol. 
+                    # But a_pol_np ALREADY contains the sign. 
+                    # Let's check `polarity_matrix` in data_prep.py.
+                    #   a = angles * measured
+                    # So X_pol = (angles * measured) dot MT
+                    #          = A_theor * sign_meas
+                    # If model agrees with data, X_pol should be POSITIVE.
+                    #
+                    # P(data|model) = P(X_pol > 0 ??)
+                    # actually it models the probability of observing "UP" or "DOWN".
+                    # Let's follow the previous logic precisely but vectorized.
+                    #
+                    # Previous logic:
+                    # mu_geom = sign_obs * X_pol  <-- This was redundant if X_pol is already signed?
+                    # No, `pt.dot(a_pol_np, mt6)` behaves like `measured * (predicted_amp)`.
+                    # So X_pol IS `mu_geom`.
+                    mu_geom = X_pol
 
-                    pm.Bernoulli(
-                        "polarity_obs",
-                        p=p_up,
-                        observed=pol_observations,
+                    # Base probability that observation is consistent with physics:
+                    # prob_consistent = 0.5 * (1 + erf( mu_geom / (sqrt(2)*sigma) ))
+                    base_prob = 0.5 * (
+                        1.0 + pt.erf(mu_geom / (pt.sqrt(2.0) * sigma_pol_bc))
                     )
 
-                # ===== Absolute Amplitude Likelihood =====
+                    # Total probability accounting for incorrect pick probability (flips):
+                    # P(obs) = inc * (1 - base_prob) + (1 - inc) * base_prob
+                    #        = inc + base_prob * (1 - 2*inc)
+                    p_sample = inc_tensor_bc + (1.0 - 2.0 * inc_tensor_bc) * base_prob
+                    
+                    # MARGINALIZATION:
+                    # Average the probabilities across the location samples (axis 1).
+                    # p_avg shape: (N_obs,)
+                    p_avg = pt.mean(p_sample, axis=1)
+
+                    # Since p_avg represents P(Observation | Model), and our observation 
+                    # is fixed (we observed what we observed), this IS the likelihood.
+                    # However, pm.Bernoulli expects a probability of "Success" (1).
+                    # Since we've already conditioned on the observation sign in X_pol,
+                    # p_avg is literally P(Observed=Observed_Value).
+                    # So we can treat this as a Bernoulli trial where we ALWAYS observe "1" (Truth),
+                    # and the probability of Truth is p_avg.
+                    
+                    pm.Potential("polarity_loglike", pt.log(p_avg + _SMALL_NUMBER))
+
+
+                # ===== Absolute Amplitude Likelihood (Marginalized) =====
                 if has_amp and a_amp_np is not None and amp_obs is not None:
-                    # Predicted absolute amplitudes
-                    amp_pred = pt.abs(pt.dot(pt.as_tensor(a_amp_np), mt6))  # (N_obs_total,)
-
-                    amp_obs_tensor = pt.as_tensor(amp_obs, dtype="float64")
+                    # a_amp_np: (N_obs, N_loc_samp, 6)
+                    # amp_pred: (N_obs, N_loc_samp)
+                    amp_pred = pt.abs(pt.tensordot(pt.as_tensor(a_amp_np), mt6, axes=[[2], [0]]))
+                    
+                    amp_obs_tensor = pt.as_tensor(amp_obs, dtype="float64") # (N_obs,)
                     log_amp_sigma_tensor = pt.as_tensor(log_amp_sigma, dtype="float64")
-                    log_amp_sigma_tensor = pt.maximum(
-                        log_amp_sigma_tensor, _SMALL_NUMBER
-                    )
+                    log_amp_sigma_tensor = pt.maximum(log_amp_sigma_tensor, _SMALL_NUMBER)
+                    
+                    # Broadcast obs and sigma to (N_obs, 1)
+                    amp_obs_bc = amp_obs_tensor.dimshuffle(0, "x")
+                    sigma_bc = log_amp_sigma_tensor.dimshuffle(0, "x")
 
-                    pm.LogNormal(
-                        "amp_obs",
-                        mu=pt.log(amp_pred + _SMALL_NUMBER),
-                        sigma=log_amp_sigma_tensor,
-                        observed=amp_obs_tensor,
-                    )
+                    # Log-Normal PDF evaluation for each sample
+                    # log(x) - log(mu) 
+                    # mu parameter of LogNormal is log(median). Here amp_pred is the median?
+                    # PyMC LogNormal(mu, sigma): X ~ exp(N(mu, sigma)).
+                    # So log(X) ~ N(mu, sigma). 
+                    # Here we want observed Amp to be distributed around Amp_Pred.
+                    # So log(Amp_Obs) ~ N( log(Amp_Pred), sigma ).
+                    
+                    # log_prob per sample: -0.5 * ((log(obs) - log(pred))/sigma)^2 - log(obs*sigma*sqrt(2pi))
+                    # We can use pm.logp simply? specific distributions are tricky in pure PT.
+                    # Let's write the Gaussian log-pdf for log-amplitudes manually to be safe/vectorized.
+                    
+                    resid_log = pt.log(amp_obs_bc) - pt.log(amp_pred + _SMALL_NUMBER)
+                    log_prob_samples = -0.5 * (resid_log / sigma_bc)**2 \
+                                       - pt.log(sigma_bc) - 0.5 * np.log(2 * np.pi) \
+                                       - pt.log(amp_obs_bc)
 
-                # ===== Amplitude Ratio Likelihood =====
+                    # Marginalize in log-space:
+                    # log( 1/N * sum( exp(log_prob) ) )
+                    # = logsumexp(log_prob) - log(N)
+                    n_samp = a_amp_np.shape[1]
+                    log_prob_marginal = pt.logsumexp(log_prob_samples, axis=1) - pt.log(n_samp)
+                    
+                    pm.Potential("amp_obs", log_prob_marginal)
+
+                # ===== Amplitude Ratio Likelihood (Marginalized) =====
                 if has_ar:
-                    # Predicted amplitudes
-                    # a1_ar_np is (N_obs, 6), mt6 is (6,)
-                    amp1_pred = pt.abs(pt.dot(pt.as_tensor(a1_ar_np), mt6))  # (N_obs,)
-                    amp2_pred = pt.abs(pt.dot(pt.as_tensor(a2_ar_np), mt6))  # (N_obs,)
+                    # a1_ar_np: (N_obs, N_loc_samp, 6)
+                    amp1_pred = pt.abs(pt.tensordot(pt.as_tensor(a1_ar_np), mt6, axes=[[2], [0]]))
+                    amp2_pred = pt.abs(pt.tensordot(pt.as_tensor(a2_ar_np), mt6, axes=[[2], [0]]))
 
-                    # Predicted log-ratio
+                    # Predicted log-ratio: (N_obs, N_loc_samp)
                     log_ratio_pred = pt.log(amp1_pred + _SMALL_NUMBER) - pt.log(amp2_pred + _SMALL_NUMBER)
 
-                    # Uncertainty parameter (per observation)
-                    # Use HalfCauchy prior for overall scale
+                    # Determine sigma
                     sigma_ar = pm.HalfCauchy("sigma_amp_ratio", beta=self.amp_ratio_sigma_prior)
+                    
+                    # Combine with measurement error
+                    log_ratio_sigma_tensor = pt.as_tensor(log_ratio_sigma, dtype="float64")
+                    sigma_combined = pt.sqrt(log_ratio_sigma_tensor**2 + sigma_ar**2)
+                    
+                    sigma_bc = sigma_combined.dimshuffle(0, "x")
+                    ratio_obs_bc = pt.as_tensor(amp_ratio_obs, dtype="float64").dimshuffle(0, "x")
+                    
+                    # Log-ratio observation model:
+                    # log(Ratio_obs) ~ N( log_ratio_pred, sigma_combined )
+                    # pdf(x) = 1/(x sigma sqrt(2pi)) * exp(...) where x is ratio_obs
+                    
+                    resid = pt.log(ratio_obs_bc) - log_ratio_pred
+                    log_prob_samples = -0.5 * (resid / sigma_bc)**2 \
+                                       - pt.log(sigma_bc) - 0.5 * np.log(2 * np.pi) \
+                                       - pt.log(ratio_obs_bc)
 
-                    # Combined uncertainty (measurement + model)
-                    sigma_combined = pt.sqrt(
-                        pt.as_tensor(log_ratio_sigma)**2 + sigma_ar**2
-                    )
-
-                    # LogNormal likelihood on the observed ratio
-                    pm.LogNormal(
-                        "amp_ratio_obs",
-                        mu=log_ratio_pred,
-                        sigma=sigma_combined,
-                        observed=amp_ratio_obs,
-                    )
+                    n_samp = a1_ar_np.shape[1]
+                    log_prob_marginal = pt.logsumexp(log_prob_samples, axis=1) - pt.log(n_samp)
+                    
+                    pm.Potential("amp_ratio_obs", log_prob_marginal)
 
                 # ===== Sampling =====
                 if self.random_seed is None:
