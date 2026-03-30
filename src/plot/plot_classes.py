@@ -2179,10 +2179,10 @@ class _FaultPlanePlot(_FocalSpherePlot):
         if self.show_max_likelihood and len(self.MTs.probability) > 1:
             if self.fault_plane:
                 self._fault_plane(self.MTs[:, self.MTs.probability == self.MTs.probability.max()], self.color,
-                                  zorder=1, *args, **kwargs)
+                                  zorder=1, linewidth=1.5, *args, **kwargs)
             elif self._nodal_line:
                 self._nodal_line(self.MTs[:, self.MTs.probability == self.MTs.probability.max()], self.color,
-                                 zorder=1, *args, **kwargs)
+                                 zorder=1, linewidth=1.5, *args, **kwargs)
         if self.show_mean and self.fault_plane:
             kwargs['linewidth'] = 2*kwargs.get('linewidth', self.linewidth)
             self.plot_plane(self.MTs.mean_strike, self.MTs.mean_dip,
