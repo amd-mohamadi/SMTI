@@ -28,9 +28,20 @@ from jax import random
 # BlackJAX imports
 import blackjax
 from blackjax.smc.resampling import systematic
+from blackjax.smc import inner_kernel_tuning
 import blackjax.mcmc.random_walk as blackjax_rw
 
 # Local imports
+from .blockwise_rmh import (
+    default_rmh_blocks,
+    build_blockwise_scale_overrides,
+)
+from .mwg_kernel import (
+    build_mwg_kernel,
+    build_mwg_parameter_update_fn,
+    default_mwg_blocks,
+    default_inner_steps,
+)
 from .tape_jax import jax_Tape_MT6, jax_Tape_MT6_batch
 from .data_prep import (
     polarity_matrix,
@@ -72,6 +83,7 @@ class InversionResult:
     weights: np.ndarray
     idata: Any
     sigma_amp_ratio: Optional[np.ndarray] = None
+    num_chains: int = 1
 
 
 class InversionBlackJAX:
@@ -128,8 +140,12 @@ class InversionBlackJAX:
         smc_target_ess_ratio: float = 0.9,
         max_smc_iterations: int = 60,
         use_nuts_adaptation: bool = True,
+        adapt_proposal: bool = True,
         min_tempering_increment: float = 1e-4,
         tempering_stall_patience: int = 8,
+        smc_method: str = "adaptive_tempered",
+        ps_target_ess: float = 5.0,
+        mechanism_steps: int = 1,
         **kwargs: Any,
     ) -> None:
         # Normalize data to a list
@@ -169,8 +185,19 @@ class InversionBlackJAX:
             raise ValueError("smc_target_ess_ratio must be in (0, 1].")
         self.max_smc_iterations = max_smc_iterations
         self.use_nuts_adaptation = use_nuts_adaptation
+        self.adapt_proposal = bool(adapt_proposal)
         self.min_tempering_increment = float(min_tempering_increment)
         self.tempering_stall_patience = int(tempering_stall_patience)
+        self.smc_method = str(smc_method).lower()
+        if self.smc_method not in {"adaptive_tempered", "adaptive_persistent"}:
+            raise ValueError(
+                "smc_method must be one of {'adaptive_tempered', 'adaptive_persistent'}"
+            )
+        self.ps_target_ess = float(ps_target_ess)
+        self.mechanism_steps = int(mechanism_steps)
+        self.num_chains = int(kwargs.pop("num_chains", 1))
+        if self.num_chains < 1:
+            raise ValueError("num_chains must be >= 1")
 
         self.rng = np.random.default_rng(self.random_seed)
         self.results: Optional[InversionResult] = None
@@ -187,7 +214,10 @@ class InversionBlackJAX:
 
         for event in self.data:
             filtered = self._filter_event_by_options(event)
-            result = self._invert_single_event(filtered)
+            if self.num_chains > 1:
+                result = self._invert_multi_chain(filtered)
+            else:
+                result = self._invert_single_event(filtered)
             event_results.append(result)
 
         self.results = event_results[0] if len(event_results) == 1 else event_results
@@ -204,7 +234,107 @@ class InversionBlackJAX:
                 filtered[key] = value
         return filtered
 
-    def _invert_single_event(self, event: DataDict) -> InversionResult:
+    def _invert_multi_chain(self, event: DataDict) -> InversionResult:
+        """Run multiple independent SMC chains and stack results."""
+        ss = np.random.SeedSequence(self.random_seed)
+        chain_seeds = [int(s) for s in ss.generate_state(self.num_chains)]
+
+        # Use the same station-angle realization for every chain so R-hat
+        # compares chains targeting the same posterior.
+        location_samples = build_location_samples_from_errors(
+            event,
+            rng=self.rng,
+            n_samples=self.location_samples_n,
+            azimuth_error=self.azimuth_error,
+            takeoff_error=self.takeoff_error,
+        )
+
+        chain_results: List[InversionResult] = []
+        original_seed = self.random_seed
+        original_rng = self.rng
+
+        for chain_idx, seed in enumerate(chain_seeds):
+            print(
+                f"\n{'=' * 40} Chain {chain_idx + 1}/{self.num_chains} "
+                f"(seed={seed}) {'=' * 40}"
+            )
+            self.random_seed = seed
+            self.rng = np.random.default_rng(seed)
+            chain_results.append(
+                self._invert_single_event(event, location_samples=location_samples)
+            )
+
+        self.random_seed = original_seed
+        self.rng = original_rng
+
+        if self.smc_method == "adaptive_persistent":
+            # Persistent sampling: chains may have different sample counts.
+            # Pad shorter chains to match the longest, using zero weights
+            # for padded samples so ArviZ can compute R-hat across chains.
+            max_n = max(r.gamma.size for r in chain_results)
+
+            def _pad_1d(arr, target_len):
+                if arr.size == target_len:
+                    return arr
+                pad_val = arr[-1]  # repeat last sample (weight=0)
+                return np.concatenate([arr, np.full(target_len - arr.size, pad_val)])
+
+            def _pad_mt6(mt6, target_len):
+                if mt6.shape[1] == target_len:
+                    return mt6
+                pad = np.tile(mt6[:, -1:], (1, target_len - mt6.shape[1]))
+                return np.concatenate([mt6, pad], axis=1)
+
+            def _pad_weights(w, target_len):
+                if w.size == target_len:
+                    return w
+                return np.concatenate([w, np.zeros(target_len - w.size)])
+
+            padded = []
+            for r in chain_results:
+                padded.append(
+                    InversionResult(
+                        mt6=_pad_mt6(r.mt6, max_n),
+                        gamma=_pad_1d(r.gamma, max_n),
+                        delta=_pad_1d(r.delta, max_n),
+                        kappa=_pad_1d(r.kappa, max_n),
+                        h=_pad_1d(r.h, max_n),
+                        sigma=_pad_1d(r.sigma, max_n),
+                        ln_p=None,
+                        weights=_pad_weights(r.weights, max_n),
+                        idata=None,
+                        sigma_amp_ratio=(
+                            _pad_1d(r.sigma_amp_ratio, max_n)
+                            if r.sigma_amp_ratio is not None
+                            else None
+                        ),
+                    )
+                )
+            chain_results = padded
+
+        return InversionResult(
+            mt6=np.stack([r.mt6 for r in chain_results], axis=0),
+            gamma=np.stack([r.gamma for r in chain_results], axis=0),
+            delta=np.stack([r.delta for r in chain_results], axis=0),
+            kappa=np.stack([r.kappa for r in chain_results], axis=0),
+            h=np.stack([r.h for r in chain_results], axis=0),
+            sigma=np.stack([r.sigma for r in chain_results], axis=0),
+            ln_p=None,
+            weights=np.stack([r.weights for r in chain_results], axis=0),
+            idata=None,
+            sigma_amp_ratio=(
+                np.stack([r.sigma_amp_ratio for r in chain_results], axis=0)
+                if chain_results[0].sigma_amp_ratio is not None
+                else None
+            ),
+            num_chains=self.num_chains,
+        )
+
+    def _invert_single_event(
+        self,
+        event: DataDict,
+        location_samples: Optional[List[Dict[str, Any]]] = None,
+    ) -> InversionResult:
         """Run SMC inversion for a single event."""
         start_time = time.time()
 
@@ -222,13 +352,14 @@ class InversionBlackJAX:
             raise ValueError("No supported data types found in event.")
 
         # Build location samples for station angle uncertainty
-        location_samples = build_location_samples_from_errors(
-            event,
-            rng=self.rng,
-            n_samples=self.location_samples_n,
-            azimuth_error=self.azimuth_error,
-            takeoff_error=self.takeoff_error,
-        )
+        if location_samples is None:
+            location_samples = build_location_samples_from_errors(
+                event,
+                rng=self.rng,
+                n_samples=self.location_samples_n,
+                azimuth_error=self.azimuth_error,
+                takeoff_error=self.takeoff_error,
+            )
 
         # Prepare polarity data
         if has_pol:
@@ -560,6 +691,8 @@ class InversionBlackJAX:
             f"finite={finite_frac:.3f}, min={ll_min:.3f}, max={ll_max:.3f}"
         )
 
+        use_blockwise = False  # Only enabled for RMH with adapt_proposal
+
         if self.mcmc_kernel == "nuts":
             print("Adapting NUTS parameters (window adaptation)...")
             init_position = jax.tree.map(lambda x: x[0], initial_particles)
@@ -617,47 +750,158 @@ class InversionBlackJAX:
             mcmc_init_fn = blackjax.nuts.init
             print("Using BlackJAX SMC rejuvenation kernel: NUTS")
         else:
-            proposal_scale = jnp.array(self.rmh_proposal_scale, dtype=jnp.float64)
-            mcmc_parameters = blackjax.smc.extend_params(
-                {"proposal_scale": proposal_scale}
-            )
             rmh_kernel = blackjax_rw.build_additive_step()
-
-            def mcmc_step_fn(rng_key, state, logdensity_fn, proposal_scale):
-                random_step = blackjax_rw.normal(proposal_scale)
-                return rmh_kernel(rng_key, state, logdensity_fn, random_step)
-
             mcmc_init_fn = blackjax.rmh.init
-            print(
-                f"Using BlackJAX SMC rejuvenation kernel: RMH (proposal_scale={float(proposal_scale):.4f})"
-            )
+            use_blockwise = self.adapt_proposal
 
-        # --- Adaptive Tempered SMC with NUTS rejuvenation ---
-        # BlackJAX expects target_ess as a RATIO in (0, 1], not an absolute count.
+            if use_blockwise:
+                # --- Metropolis-Within-Gibbs (MWG) kernel ---
+                blocks = default_mwg_blocks(dc=dc, has_ar=has_ar)
+                field_names = list(initial_particles.keys())
+
+                initial_stds_by_field = {
+                    name: float(jnp.std(initial_particles[name]))
+                    for name in field_names
+                }
+
+                inner_steps = default_inner_steps(mechanism_steps=self.mechanism_steps)
+
+                mwg_step_fn = build_mwg_kernel(
+                    blocks=blocks,
+                    inner_steps_per_block=inner_steps,
+                )
+                mcmc_parameter_update_fn = build_mwg_parameter_update_fn(
+                    blocks=blocks,
+                    field_names=field_names,
+                    initial_stds=initial_stds_by_field,
+                )
+
+                initial_scales = build_blockwise_scale_overrides(
+                    blocks=blocks,
+                    initial_stds=initial_stds_by_field,
+                    current_stds=initial_stds_by_field,
+                )
+                initial_parameter_value = {
+                    name: jnp.asarray(scale)[None]
+                    for name, scale in initial_scales.items()
+                }
+
+                block_names_str = ", ".join(
+                    f"{b.name}(x{inner_steps.get(b.name, 1)})" for b in blocks
+                )
+                print(f"Using MWG kernel: blocks=[{block_names_str}]")
+            else:
+                # --- Standard isotropic RMH ---
+                proposal_scale = jnp.array(self.rmh_proposal_scale, dtype=jnp.float64)
+                mcmc_parameters = blackjax.smc.extend_params(
+                    {"proposal_scale": proposal_scale}
+                )
+
+                def mcmc_step_fn(rng_key, state, logdensity_fn, proposal_scale):
+                    random_step = blackjax_rw.normal(proposal_scale)
+                    return rmh_kernel(rng_key, state, logdensity_fn, random_step)
+
+                print(
+                    f"Using BlackJAX SMC rejuvenation kernel: RMH (proposal_scale={float(proposal_scale):.4f})"
+                )
+
+        # --- SMC Sampler Construction ---
+        use_persistent = self.smc_method == "adaptive_persistent"
         target_ess = self.smc_target_ess_ratio
-        smc = blackjax.adaptive_tempered_smc(
-            logprior_fn=logprior_fn,
-            loglikelihood_fn=loglikelihood_fn,
-            mcmc_step_fn=mcmc_step_fn,
-            mcmc_init_fn=mcmc_init_fn,
-            mcmc_parameters=mcmc_parameters,
-            resampling_fn=systematic,
-            target_ess=target_ess,
-            num_mcmc_steps=self.num_mcmc_steps,
-        )
+
+        if use_persistent:
+            if use_blockwise:
+                # Use MWG with fixed scales (no adaptation, but multiple inner steps)
+                fixed_scales = {
+                    name: jnp.asarray(scale) for name, scale in initial_scales.items()
+                }
+
+                def mcmc_step_fn_persistent(
+                    rng_key, state, logdensity_fn, _unused_scale
+                ):
+                    return mwg_step_fn(rng_key, state, logdensity_fn, **fixed_scales)
+
+                mcmc_parameters = blackjax.smc.extend_params(
+                    {"_unused_scale": jnp.array(0.0)}
+                )
+                mcmc_step_fn = mcmc_step_fn_persistent
+                print(
+                    "Note: persistent sampling uses MWG with fixed scales (no adaptation)"
+                )
+
+            smc = blackjax.adaptive_persistent_sampling_smc(
+                logprior_fn,
+                loglikelihood_fn,
+                self.max_smc_iterations,
+                mcmc_step_fn,
+                mcmc_init_fn,
+                mcmc_parameters,
+                systematic,
+                target_ess=self.ps_target_ess,
+                num_mcmc_steps=self.num_mcmc_steps,
+            )
+        elif use_blockwise:
+            smc = inner_kernel_tuning.as_top_level_api(
+                smc_algorithm=blackjax.adaptive_tempered_smc,
+                logprior_fn=logprior_fn,
+                loglikelihood_fn=loglikelihood_fn,
+                mcmc_step_fn=mwg_step_fn,
+                mcmc_init_fn=mcmc_init_fn,
+                resampling_fn=systematic,
+                mcmc_parameter_update_fn=mcmc_parameter_update_fn,
+                initial_parameter_value=initial_parameter_value,
+                target_ess=target_ess,
+                num_mcmc_steps=self.num_mcmc_steps,
+            )
+        else:
+            smc = blackjax.adaptive_tempered_smc(
+                logprior_fn=logprior_fn,
+                loglikelihood_fn=loglikelihood_fn,
+                mcmc_step_fn=mcmc_step_fn,
+                mcmc_init_fn=mcmc_init_fn,
+                mcmc_parameters=mcmc_parameters,
+                resampling_fn=systematic,
+                target_ess=target_ess,
+                num_mcmc_steps=self.num_mcmc_steps,
+            )
 
         state = smc.init(initial_particles)
         step = jax.jit(smc.step)
 
-        print(f"Running BlackJAX adaptive tempered SMC ({self.mcmc_kernel.upper()})...")
-        prev_beta = float(state.tempering_param)
+        def _get_smc_state(st):
+            """Unwrap StateWithParameterOverride if needed."""
+            return st.sampler_state if hasattr(st, "sampler_state") else st
+
+        if use_persistent:
+            from blackjax.smc.persistent_sampling import compute_persistent_ess
+
+        method_name = (
+            "adaptive persistent SMC" if use_persistent else "adaptive tempered SMC"
+        )
+        print(f"Running BlackJAX {method_name} ({self.mcmc_kernel.upper()})...")
+        smc_st = _get_smc_state(state)
+        prev_beta = float(smc_st.tempering_param)
         stall_count = 0
         for iteration in range(self.max_smc_iterations):
-            if float(state.tempering_param) >= 1.0 - 1e-6:
-                break
+            smc_st = _get_smc_state(state)
+            if use_persistent:
+                at_target = float(smc_st.tempering_param) >= 1.0 - 1e-6
+                if at_target:
+                    p_ess = float(
+                        compute_persistent_ess(
+                            jnp.log(smc_st.persistent_weights),
+                            normalize_weights=True,
+                        )
+                    )
+                    if p_ess >= self.ps_target_ess * self.num_particles:
+                        break
+            else:
+                if float(smc_st.tempering_param) >= 1.0 - 1e-6:
+                    break
             key, subkey = random.split(key)
             state, info = step(subkey, state)
-            curr_beta = float(state.tempering_param)
+            smc_st = _get_smc_state(state)
+            curr_beta = float(smc_st.tempering_param)
             if not np.isfinite(curr_beta):
                 raise RuntimeError(
                     "BlackJAX SMC produced non-finite tempering parameter (beta=NaN/Inf). "
@@ -666,7 +910,18 @@ class InversionBlackJAX:
             delta_beta = curr_beta - prev_beta
             prev_beta = curr_beta
 
-            ess = float(1.0 / jnp.sum(state.weights**2))
+            if use_persistent:
+                p_ess = float(
+                    compute_persistent_ess(
+                        jnp.log(smc_st.persistent_weights),
+                        normalize_weights=True,
+                    )
+                )
+                ess_str = f"pESS={p_ess:.0f}"
+            else:
+                ess = float(1.0 / jnp.sum(smc_st.weights**2))
+                ess_str = f"ESS={ess:.0f}/{self.num_particles}"
+
             acc_rate = None
             update_info = getattr(info, "update_info", None)
             if update_info is not None and hasattr(update_info, "acceptance_rate"):
@@ -682,12 +937,12 @@ class InversionBlackJAX:
 
             if acc_rate is None:
                 print(
-                    f"  Stage {iteration + 1}: beta={curr_beta:.4f} (d={delta_beta:.5f}), ESS={ess:.0f}/{self.num_particles}"
+                    f"  Stage {iteration + 1}: beta={curr_beta:.4f} (d={delta_beta:.5f}), {ess_str}"
                 )
             else:
                 print(
                     f"  Stage {iteration + 1}: beta={curr_beta:.4f} (d={delta_beta:.5f}), "
-                    f"ESS={ess:.0f}/{self.num_particles}, acc={acc_rate:.3f}"
+                    f"{ess_str}, acc={acc_rate:.3f}"
                 )
 
             if delta_beta < self.min_tempering_increment:
@@ -703,12 +958,31 @@ class InversionBlackJAX:
                 break
 
         elapsed = time.time() - start_time
+        smc_st = _get_smc_state(state)
         print(
-            f"SMC completed in {elapsed:.2f}s with beta={float(state.tempering_param):.4f}"
+            f"SMC completed in {elapsed:.2f}s with beta={float(smc_st.tempering_param):.4f}"
         )
 
         # --- Extract Results ---
-        particles_phys = _unconstrained_to_params(state.particles)
+        if use_persistent:
+            from blackjax.smc.persistent_sampling import remove_padding
+
+            smc_st = remove_padding(smc_st)
+
+            # persistent_particles: {field: (n_iter+1, n_particles)}
+            # persistent_weights:   (n_iter+1, n_particles)
+            # Flatten across iterations to get all accumulated samples
+            flat_particles = jax.tree.map(
+                lambda x: x.reshape(-1), smc_st.persistent_particles
+            )
+            particles_phys = _unconstrained_to_params(flat_particles)
+
+            raw_pw = np.asarray(smc_st.persistent_weights).reshape(-1)
+            final_weights = raw_pw / raw_pw.sum()
+        else:
+            particles_phys = _unconstrained_to_params(smc_st.particles)
+            final_weights = np.asarray(smc_st.weights)
+
         gamma_s = np.asarray(particles_phys["gamma"])
         delta_s = np.asarray(particles_phys["delta"])
         kappa_s = np.asarray(particles_phys["kappa"])
@@ -716,7 +990,6 @@ class InversionBlackJAX:
         sigma_s = np.asarray(particles_phys["sigma"])
         n_samp = gamma_s.size
 
-        # Convert to MT6
         from .tape import Tape_MT6
 
         if has_ar:
@@ -724,18 +997,12 @@ class InversionBlackJAX:
         else:
             sigma_ar_s = None
 
-        n_samp = gamma_s.size
-
-        # Convert to MT6
         mt6_samples = Tape_MT6(gamma_s, delta_s, kappa_s, h_s, sigma_s)
         mt6_samples = np.asarray(mt6_samples, dtype=float)
         if mt6_samples.ndim == 1:
             mt6_samples = mt6_samples.reshape(6, n_samp)
         elif mt6_samples.shape != (6, n_samp):
             mt6_samples = mt6_samples.reshape(6, n_samp)
-
-        # Final weights
-        final_weights = np.asarray(state.weights)
 
         return InversionResult(
             mt6=mt6_samples,
@@ -746,7 +1013,7 @@ class InversionBlackJAX:
             sigma=sigma_s,
             ln_p=None,
             weights=final_weights,
-            idata=None,  # No arviz InferenceData for BlackJAX
+            idata=None,
             sigma_amp_ratio=sigma_ar_s,
         )
 

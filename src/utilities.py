@@ -49,7 +49,9 @@ def find_map_mt6_kde(mt6_samples: np.ndarray) -> Tuple[np.ndarray, int]:
     """
     mt6_samples = np.asarray(mt6_samples, dtype=float)
     if mt6_samples.ndim != 2 or mt6_samples.shape[0] != 6:
-        raise ValueError(f"mt6_samples must have shape (6, n_samples), got {mt6_samples.shape}")
+        raise ValueError(
+            f"mt6_samples must have shape (6, n_samples), got {mt6_samples.shape}"
+        )
 
     # Transpose for easier linear algebra: X is (n_samples, 6)
     X = mt6_samples.T
@@ -206,7 +208,9 @@ def cluster_mt6_posterior(
     """
     mt6_samples = np.asarray(mt6_samples, dtype=float)
     if mt6_samples.ndim != 2 or mt6_samples.shape[0] != 6:
-        raise ValueError(f"mt6_samples must have shape (6, n_samples), got {mt6_samples.shape}")
+        raise ValueError(
+            f"mt6_samples must have shape (6, n_samples), got {mt6_samples.shape}"
+        )
 
     X = mt6_samples.T  # (n_samples, 6)
 
@@ -275,7 +279,9 @@ def cluster_mt6_posterior_hdbscan(
     """
     mt6_samples = np.asarray(mt6_samples, dtype=float)
     if mt6_samples.ndim != 2 or mt6_samples.shape[0] != 6:
-        raise ValueError(f"mt6_samples must have shape (6, n_samples), got {mt6_samples.shape}")
+        raise ValueError(
+            f"mt6_samples must have shape (6, n_samples), got {mt6_samples.shape}"
+        )
 
     X = mt6_samples.T  # (n_samples, 6)
     if min_samples is None:
@@ -430,7 +436,9 @@ def angle_mode_analysis(
         labels = np.zeros(angles_deg.size, dtype=int)
         mode_weights = np.array([1.0], dtype=float)
     else:
-        diffs = np.abs(angles_deg[:, None] - mode_centers[None, :])  # (n_samples, n_modes)
+        diffs = np.abs(
+            angles_deg[:, None] - mode_centers[None, :]
+        )  # (n_samples, n_modes)
         labels = np.argmin(diffs, axis=1)
         counts = np.bincount(labels, minlength=n_modes).astype(float)
         mode_weights = counts / counts.sum()
@@ -589,7 +597,9 @@ def angular_uncertainty(
     mt6_ref = np.asarray(mt6_ref, dtype=float).reshape(6)
     mt6_samples = np.asarray(mt6_samples, dtype=float)
     if mt6_samples.ndim != 2 or mt6_samples.shape[0] != 6:
-        raise ValueError(f"mt6_samples must have shape (6, n_samples), got {mt6_samples.shape}")
+        raise ValueError(
+            f"mt6_samples must have shape (6, n_samples), got {mt6_samples.shape}"
+        )
 
     num = np.dot(mt6_ref, mt6_samples)  # (n_samples,)
     den = np.linalg.norm(mt6_ref) * np.linalg.norm(mt6_samples, axis=0)
@@ -607,10 +617,12 @@ def angular_uncertainty(
 
 
 def mt_quality_score(
-    idata: "az.InferenceData",
     mt6_samples: np.ndarray,
     mt6_mode: np.ndarray,
-    ess_target: int = 400,
+    final_weights: Optional[np.ndarray] = None,
+    n_particles: Optional[int] = None,
+    idata: Optional["az.InferenceData"] = None,
+    ess_target: float = 400.0,
     angle_good: float = 5.0,
     angle_bad: float = 30.0,
 ) -> Dict[str, float]:
@@ -619,7 +631,7 @@ def mt_quality_score(
 
     The score combines three components:
 
-    - ``s_conv`` : sampler convergence (based on max R-hat and min ESS).
+    - ``s_conv`` : sampler convergence from worst-case ``\hat{R}`` and bulk ESS.
     - ``s_angle`` : angular concentration of MT6 samples around the mode
       (more heavily weighted).
     - ``s_modes`` : degree of unimodality in angular space.
@@ -628,21 +640,25 @@ def mt_quality_score(
 
     Parameters
     ----------
-    idata : arviz.InferenceData
-        Inference data object returned by PyMC.
     mt6_samples : np.ndarray
         Posterior MT6 samples, shape (6, n_samples).
     mt6_mode : np.ndarray
         Reference MT6 vector (typically the MAP-like solution), shape (6,).
-    ess_target : int, default 400
-        Target effective sample size for a "good" chain.
+    final_weights : np.ndarray, optional
+        Normalized SMC posterior weights. Kept for compatibility and returned
+        via ``ess_weights``/``ess_ratio`` diagnostics.
+    n_particles : int, optional
+        Total number of particles. If None, inferred from
+        ``final_weights.size``.
+    idata : arviz.InferenceData, optional
+        InferenceData used to compute worst-case ``\hat{R}`` and bulk ESS for
+        the convergence sub-score.
+    ess_target : float, default 400.0
+        Target bulk ESS used in the convergence ramp.
     angle_good : float, default 5.0
-        Angular half-width (degrees) that is considered very good. Values
-        larger than this start to reduce the quality score noticeably.
+        Angular half-width (degrees) that is considered very good.
     angle_bad : float, default 30.0
-        Angular half-width (degrees) that is considered very poor. Angles
-        at or above this drive the angular component of the score close to
-        zero.
+        Angular half-width (degrees) that is considered very poor.
 
     Returns
     -------
@@ -653,39 +669,47 @@ def mt_quality_score(
         - ``s_conv`` : convergence sub-score in [0, 1].
         - ``s_angle`` : angular concentration sub-score in [0, 1].
         - ``s_modes`` : unimodality sub-score in [0, 1].
-        - ``rhat_max`` : maximum R-hat over selected parameters.
-        - ``ess_min`` : minimum bulk ESS over selected parameters.
+        - ``ess_weights`` : effective sample size from importance weights.
+        - ``ess_ratio`` : ESS / N_particles.
         - ``q50`` : 50% angular quantile (degrees).
         - ``q90`` : 90% angular quantile (degrees).
         - ``top_mode_weight`` : weight of the dominant angular mode.
         - ``quality_label`` : qualitative label ('high', 'moderate', 'low').
     """
-    # ----- 1) Convergence score -----
-    post = idata.posterior
-    requested_vars = ["gamma", "delta", "kappa", "h", "sigma"]
-    var_names = [v for v in requested_vars if v in post.data_vars]
-
-    if var_names:
-        summary = az.summary(idata, var_names=var_names)
-        rhat_max = float(summary["r_hat"].max())
-        ess_min = float(summary["ess_bulk"].min())
+    # ----- 1) Convergence score (worst-case R-hat and bulk ESS) -----
+    if final_weights is not None:
+        w = np.asarray(final_weights, dtype=np.float64)
+        w_sum = w.sum()
+        if w_sum > 0:
+            w = w / w_sum
+        n = n_particles if n_particles is not None else w.size
+        ess_weights = float(1.0 / np.sum(w**2))
+        ess_ratio = ess_weights / n
     else:
-        # Fallback for DC-only cases with no source-type parameters
-        rhat_max = 1.0
-        ess_min = 0.0
+        ess_weights = 0.0
+        ess_ratio = 0.0
 
-    if np.isnan(rhat_max):
-        s_rhat = 0.0
-    else:
-        # r_hat ≈ 1.0 is ideal; r_hat ≥ 1.10 is poor
-        s_rhat = float(np.clip((1.10 - rhat_max) / 0.10, 0.0, 1.0))
-
-    if ess_target <= 0:
-        s_ess = 0.0
-    else:
-        s_ess = float(np.clip(ess_min / float(ess_target), 0.0, 1.0))
-
-    s_conv = 0.5 * s_rhat + 0.5 * s_ess
+    s_conv = 0.0
+    if idata is not None:
+        conv_summary = az.summary(
+            idata,
+            var_names=["gamma", "delta", "kappa", "h", "sigma"],
+            kind="all",
+        )
+        if not conv_summary.empty:
+            r_hat_vals = conv_summary["r_hat"].to_numpy(dtype=float)
+            ess_vals = conv_summary["ess_bulk"].to_numpy(dtype=float)
+            finite_rhat = r_hat_vals[np.isfinite(r_hat_vals)]
+            finite_ess = ess_vals[np.isfinite(ess_vals)]
+            s_rhat = 0.0
+            s_ess = 0.0
+            if finite_rhat.size:
+                r_hat_max = float(finite_rhat.max())
+                s_rhat = float(np.clip((1.10 - r_hat_max) / 0.10, 0.0, 1.0))
+            if finite_ess.size:
+                ess_min = float(finite_ess.min())
+                s_ess = float(np.clip(ess_min / ess_target, 0.0, 1.0))
+            s_conv = 0.5 * s_rhat + 0.5 * s_ess
 
     # ----- 2) Angular concentration score -----
     ang_info = angular_uncertainty(mt6_mode, mt6_samples, quantiles=(50.0, 90.0))
@@ -693,9 +717,7 @@ def mt_quality_score(
 
     def _angle_score(q_deg: float) -> float:
         # angle_good -> score ~1, angle_bad or worse -> score ~0
-        return float(
-            np.clip((angle_bad - q_deg) / (angle_bad - angle_good), 0.0, 1.0)
-        )
+        return float(np.clip((angle_bad - q_deg) / (angle_bad - angle_good), 0.0, 1.0))
 
     s_angle = 0.5 * _angle_score(q50) + 0.5 * _angle_score(q90)
 
@@ -725,8 +747,8 @@ def mt_quality_score(
         "s_conv": float(s_conv),
         "s_angle": float(s_angle),
         "s_modes": float(s_modes),
-        "rhat_max": float(rhat_max),
-        "ess_min": float(ess_min),
+        "ess_weights": float(ess_weights),
+        "ess_ratio": float(ess_ratio),
         "q50": float(q50),
         "q90": float(q90),
         "top_mode_weight": float(top_mode_weight),
@@ -748,6 +770,14 @@ def generate_synthetic_event_data(
     amplitude_bias_lognormal_sigma: Optional[float] = None,
     amplitude_outlier_fraction: float = 0.0,
     amplitude_outlier_scale: float = 3.0,
+    amplitude_ratio_noise_model: str = "legacy",
+    amplitude_ratio_station_sigma: float = 0.0,
+    amplitude_ratio_observation_sigma: float = 0.0,
+    amplitude_ratio_outlier_fraction: float = 0.0,
+    amplitude_ratio_outlier_sigma: float = 0.0,
+    amplitude_ratio_min_snr: Optional[float] = None,
+    amplitude_ratio_low_snr_sigma: float = 0.0,
+    amplitude_ratio_station_terms: Optional[Dict[str, Any]] = None,
     amplitude_bias_num: Optional[Any] = None,
     amplitude_bias_den: Optional[Any] = None,
     amplitude_bias_P: Optional[Any] = None,
@@ -768,9 +798,9 @@ def generate_synthetic_event_data(
     ----------
     inversion_options
         Sequence of data-type keys such as
-        ``['PPolarity', 'P/SHAmplitudeRatio', 'P/SVAmplitudeRatio']``.
-        Only polarity keys (``*Polarity``) and amplitude-ratio keys
-        (``*AmplitudeRatio``) are currently supported.
+        ``['PPolarity', 'PAmplitude', 'P/SHAmplitudeRatio']``.
+        Polarity keys (``*Polarity``), absolute amplitudes (``*Amplitude``),
+        and amplitude-ratio keys (``*AmplitudeRatio``) are supported.
     true_mt6
         True MT six-vector used to generate the synthetic data, shape (6,).
     azimuth
@@ -810,14 +840,45 @@ def generate_synthetic_event_data(
     amplitude_bias_lognormal_sigma
         If provided and > 0, apply per-station multiplicative biases drawn
         from ``LogNormal(mean=0, sigma=amplitude_bias_lognormal_sigma)`` to
-        both numerator and denominator true amplitudes (mimics site/path
-        effects).
+        synthetic amplitudes when ``amplitude_ratio_noise_model="composite"``;
+        in legacy mode it retains the existing ratio-only behaviour.
     amplitude_outlier_fraction
         Fraction of stations to flag as amplitude outliers. Those stations have
         their fractional errors inflated by ``amplitude_outlier_scale``.
     amplitude_outlier_scale
         Multiplicative inflation applied to the fractional error for outlier
         stations (see ``amplitude_outlier_fraction``).
+    amplitude_ratio_noise_model
+        ``"legacy"`` preserves the existing amplitude and ratio noise paths.
+        ``"composite"`` builds noisy P, SH, and SV amplitudes once in log
+        space using shared station terms, per-observation scatter, rare
+        outliers, and weak-phase inflation, then reuses that same realization
+        for absolute amplitudes and any requested amplitude ratios.
+    amplitude_ratio_station_sigma
+        Composite-mode station-term scatter expressed as a natural-log ratio
+        sigma. It is split evenly across numerator and denominator phase
+        amplitudes.
+    amplitude_ratio_observation_sigma
+        Composite-mode per-observation scatter expressed as a natural-log ratio
+        sigma. It is split evenly across numerator and denominator phase
+        amplitudes.
+    amplitude_ratio_outlier_fraction
+        Fraction of composite-mode observations assigned an additional gross
+        error term.
+    amplitude_ratio_outlier_sigma
+        Natural-log ratio sigma of the additional composite-mode outlier term.
+    amplitude_ratio_min_snr
+        Optional SNR-proxy threshold used in composite mode. Stations whose
+        phase amplitudes fall below the threshold receive additional noise
+        inflation, which also covers nodal weak-phase behaviour.
+    amplitude_ratio_low_snr_sigma
+        Additional natural-log sigma scale used when
+        ``amplitude_ratio_min_snr`` is triggered in composite mode.
+    amplitude_ratio_station_terms
+        Optional mapping of phase name to precomputed per-station log-amplitude
+        residuals used in composite mode. Keys should be phase labels such as
+        ``"P"``, ``"SH"``, or ``"SV"`` and values must be scalar or length-
+        ``N_stations`` arrays.
     amplitude_bias_num
         Optional systematic multiplicative bias applied to the **true**
         numerator amplitudes when generating amplitude-ratio data. Can be
@@ -846,6 +907,7 @@ def generate_synthetic_event_data(
     """
     if rng is None:
         rng = np.random.default_rng()
+    assert rng is not None
 
     true_mt6 = np.asarray(true_mt6, dtype=float).reshape(6)
 
@@ -883,14 +945,34 @@ def generate_synthetic_event_data(
             "amplitude_error_mode must be 'amplitude' or 'ratio', "
             f"got {amplitude_error_mode!r}"
         )
+    if amplitude_ratio_noise_model not in ("legacy", "composite"):
+        raise ValueError(
+            "amplitude_ratio_noise_model must be 'legacy' or 'composite', "
+            f"got {amplitude_ratio_noise_model!r}"
+        )
     if ratio_error_boost <= 0:
         raise ValueError("ratio_error_boost must be positive.")
-    if amplitude_bias_lognormal_sigma is not None and amplitude_bias_lognormal_sigma < 0:
+    if (
+        amplitude_bias_lognormal_sigma is not None
+        and amplitude_bias_lognormal_sigma < 0
+    ):
         raise ValueError("amplitude_bias_lognormal_sigma must be non-negative.")
     if not (0.0 <= amplitude_outlier_fraction <= 1.0):
         raise ValueError("amplitude_outlier_fraction must be in [0, 1].")
     if amplitude_outlier_scale <= 0:
         raise ValueError("amplitude_outlier_scale must be positive.")
+    if amplitude_ratio_station_sigma < 0:
+        raise ValueError("amplitude_ratio_station_sigma must be non-negative.")
+    if amplitude_ratio_observation_sigma < 0:
+        raise ValueError("amplitude_ratio_observation_sigma must be non-negative.")
+    if not (0.0 <= amplitude_ratio_outlier_fraction <= 1.0):
+        raise ValueError("amplitude_ratio_outlier_fraction must be in [0, 1].")
+    if amplitude_ratio_outlier_sigma < 0:
+        raise ValueError("amplitude_ratio_outlier_sigma must be non-negative.")
+    if amplitude_ratio_min_snr is not None and amplitude_ratio_min_snr <= 0:
+        raise ValueError("amplitude_ratio_min_snr must be positive when provided.")
+    if amplitude_ratio_low_snr_sigma < 0:
+        raise ValueError("amplitude_ratio_low_snr_sigma must be non-negative.")
 
     def _apply_bias(arr: np.ndarray, bias: Optional[Any], label: str) -> np.ndarray:
         if bias is None:
@@ -907,6 +989,160 @@ def generate_synthetic_event_data(
         "sh": amplitude_bias_SH,
         "sv": amplitude_bias_SV,
     }
+
+    def _copy_stations() -> Dict[str, Any]:
+        stations = {
+            "Azimuth": azimuth.copy(),
+            "TakeOffAngle": takeoff.copy(),
+            "Name": list(station_names),
+        }
+        if "Azimuth_err" in stations_base:
+            stations["Azimuth_err"] = stations_base["Azimuth_err"].copy()
+        if "TakeOff_err" in stations_base:
+            stations["TakeOff_err"] = stations_base["TakeOff_err"].copy()
+        return stations
+
+    def _normalise_phase_name(label: str) -> str:
+        phase = label.replace("_", "").lower()
+        phase = phase.rstrip("rms")
+        phase = phase.rstrip("q")
+        return phase
+
+    composite_mode = amplitude_ratio_noise_model == "composite"
+    composite_phase_cache: Dict[str, Dict[str, np.ndarray]] = {}
+
+    if composite_mode:
+        required_phases = set()
+        for key in inversion_options:
+            key_lower_clean = str(key).lower().replace("_", "")
+            if "amplituderatio" in key_lower_clean:
+                ratio_phase = key_lower_clean.split("amplituderatio")[0]
+                ratio_phase = ratio_phase.rstrip("rms").rstrip("q")
+                if "/" in ratio_phase:
+                    num_phase, den_phase = ratio_phase.split("/", 1)
+                    required_phases.add(num_phase)
+                    required_phases.add(den_phase)
+            elif "amplitude" in key_lower_clean:
+                phase = key_lower_clean.split("amplitude")[0]
+                phase = phase.rstrip("rms").rstrip("q")
+                if phase:
+                    required_phases.add(phase)
+
+        station_terms_lookup: Dict[str, np.ndarray] = {}
+        if amplitude_ratio_station_terms is not None:
+            for phase_name, values in amplitude_ratio_station_terms.items():
+                phase_key = _normalise_phase_name(str(phase_name))
+                arr = np.asarray(values, dtype=float).reshape(-1)
+                if arr.size == 1:
+                    arr = np.full(n_stations, float(arr[0]), dtype=float)
+                elif arr.size != n_stations:
+                    raise ValueError(
+                        "amplitude_ratio_station_terms[{!r}] must be scalar or have length n_stations".format(
+                            phase_name
+                        )
+                    )
+                station_terms_lookup[phase_key] = arr.astype(float)
+
+        station_sigma_component = amplitude_ratio_station_sigma / np.sqrt(2.0)
+        observation_sigma_component = amplitude_ratio_observation_sigma / np.sqrt(2.0)
+        outlier_sigma_component = amplitude_ratio_outlier_sigma / np.sqrt(2.0)
+        base_frac_scale = max(0.5 * (amp_err_min + amp_err_max), 1e-6)
+
+        for phase in sorted(required_phases):
+            amp_true = np.asarray(
+                forward_amplitude(true_mt6, stations_base, phase.upper()),
+                dtype=float,
+            ).reshape(-1)
+            amp_true = _apply_bias(
+                amp_true,
+                phase_bias.get(phase),
+                f"amplitude_bias_{phase.upper()}",
+            )
+            amp_true = np.abs(amp_true)
+            amp_safe = np.clip(amp_true, 1e-12, np.inf)
+            log_amp_true = np.log(amp_safe)
+
+            if amplitude_bias_lognormal_sigma and amplitude_bias_lognormal_sigma > 0:
+                phase_bias_term = rng.normal(
+                    0.0, amplitude_bias_lognormal_sigma, size=n_stations
+                )
+            else:
+                phase_bias_term = np.zeros(n_stations, dtype=float)
+
+            if phase in station_terms_lookup:
+                station_term = station_terms_lookup[phase].copy()
+            elif station_sigma_component > 0.0:
+                station_term = rng.normal(0.0, station_sigma_component, size=n_stations)
+            else:
+                station_term = np.zeros(n_stations, dtype=float)
+
+            base_sigma = rng.uniform(amp_err_min, amp_err_max, size=n_stations)
+            if amplitude_outlier_fraction > 0.0:
+                legacy_outlier_mask = (
+                    rng.random(size=n_stations) < amplitude_outlier_fraction
+                )
+                base_sigma = np.where(
+                    legacy_outlier_mask,
+                    base_sigma * amplitude_outlier_scale,
+                    base_sigma,
+                )
+            base_term = rng.normal(0.0, base_sigma)
+
+            if observation_sigma_component > 0.0:
+                observation_term = rng.normal(
+                    0.0, observation_sigma_component, size=n_stations
+                )
+            else:
+                observation_term = np.zeros(n_stations, dtype=float)
+
+            outlier_sigma = np.zeros(n_stations, dtype=float)
+            if amplitude_ratio_outlier_fraction > 0.0 and outlier_sigma_component > 0.0:
+                ratio_outlier_mask = (
+                    rng.random(size=n_stations) < amplitude_ratio_outlier_fraction
+                )
+                outlier_sigma = np.where(
+                    ratio_outlier_mask,
+                    outlier_sigma_component,
+                    0.0,
+                )
+            outlier_term = rng.normal(0.0, outlier_sigma)
+
+            low_snr_sigma = np.zeros(n_stations, dtype=float)
+            if (
+                amplitude_ratio_min_snr is not None
+                and amplitude_ratio_low_snr_sigma > 0.0
+            ):
+                reference_amp = max(float(np.median(amp_safe)), 1e-12)
+                snr_proxy = amp_safe / max(base_frac_scale * reference_amp, 1e-12)
+                snr_shortfall = np.clip(
+                    amplitude_ratio_min_snr / np.maximum(snr_proxy, 1e-12) - 1.0,
+                    0.0,
+                    5.0,
+                )
+                low_snr_sigma = amplitude_ratio_low_snr_sigma * snr_shortfall
+            low_snr_term = rng.normal(0.0, low_snr_sigma)
+
+            total_sigma = np.sqrt(
+                base_sigma**2
+                + station_sigma_component**2
+                + observation_sigma_component**2
+                + outlier_sigma**2
+                + low_snr_sigma**2
+            )
+            measured = np.exp(
+                log_amp_true
+                + phase_bias_term
+                + station_term
+                + base_term
+                + observation_term
+                + outlier_term
+                + low_snr_term
+            )
+            composite_phase_cache[phase] = {
+                "measured": measured.astype(float),
+                "error": (total_sigma * measured).astype(float),
+                "sigma": total_sigma.astype(float),
+            }
 
     # ---- Build each requested data type ----
     for key in inversion_options:
@@ -928,26 +1164,28 @@ def generate_synthetic_event_data(
                 -1, 1
             )
 
-            stations = {
-                "Azimuth": azimuth.copy(),
-                "TakeOffAngle": takeoff.copy(),
-                "Name": list(station_names),
-            }
-            if "Azimuth_err" in stations_base:
-                stations["Azimuth_err"] = stations_base["Azimuth_err"].copy()
-            if "TakeOff_err" in stations_base:
-                stations["TakeOff_err"] = stations_base["TakeOff_err"].copy()
-
             event[key_str] = {
                 "Measured": measured,
                 "Error": error_vals,
-                "Stations": stations,
+                "Stations": _copy_stations(),
             }
         # Absolute amplitude data (e.g. 'PAmplitude', 'SHAmplitude', 'SVAmplitude')
-        elif "amplitude" in key_lower and "amplituderatio" not in key_lower and "amplitude_ratio" not in key_lower:
+        elif (
+            "amplitude" in key_lower
+            and "amplituderatio" not in key_lower
+            and "amplitude_ratio" not in key_lower
+        ):
             phase = key_lower.replace("_", "").split("amplitude")[0]  # 'p', 'sh', 'sv'
             phase = phase.rstrip("rms").rstrip("q")
             if phase == "":
+                continue
+
+            if composite_mode and phase in composite_phase_cache:
+                event[key_str] = {
+                    "Measured": composite_phase_cache[phase]["measured"].reshape(-1, 1),
+                    "Error": composite_phase_cache[phase]["error"].reshape(-1, 1),
+                    "Stations": _copy_stations(),
+                }
                 continue
 
             amp_true = np.asarray(
@@ -956,7 +1194,9 @@ def generate_synthetic_event_data(
             ).reshape(-1)
 
             # Apply per-phase bias if requested
-            amp_true = _apply_bias(amp_true, phase_bias.get(phase), f"amplitude_bias_{phase.upper()}")
+            amp_true = _apply_bias(
+                amp_true, phase_bias.get(phase), f"amplitude_bias_{phase.upper()}"
+            )
 
             amp_true = np.abs(amp_true)
             amp_safe = np.clip(amp_true, 1e-12, np.inf)
@@ -975,20 +1215,10 @@ def generate_synthetic_event_data(
             measured = meas.reshape(-1, 1)
             error = err.reshape(-1, 1)
 
-            stations = {
-                "Azimuth": azimuth.copy(),
-                "TakeOffAngle": takeoff.copy(),
-                "Name": list(station_names),
-            }
-            if "Azimuth_err" in stations_base:
-                stations["Azimuth_err"] = stations_base["Azimuth_err"].copy()
-            if "TakeOff_err" in stations_base:
-                stations["TakeOff_err"] = stations_base["TakeOff_err"].copy()
-
             event[key_str] = {
                 "Measured": measured,
                 "Error": error,
-                "Stations": stations,
+                "Stations": _copy_stations(),
             }
 
         # Amplitude ratio data (e.g. 'P/SHAmplitudeRatio')
@@ -999,6 +1229,45 @@ def generate_synthetic_event_data(
                 continue
 
             num_phase, den_phase = phase.split("/", 1)
+
+            if composite_mode:
+                if (
+                    num_phase not in composite_phase_cache
+                    or den_phase not in composite_phase_cache
+                ):
+                    raise KeyError(
+                        "Composite amplitude cache missing phase pair {} / {}".format(
+                            num_phase, den_phase
+                        )
+                    )
+
+                num_meas = composite_phase_cache[num_phase]["measured"].copy()
+                den_meas = composite_phase_cache[den_phase]["measured"].copy()
+                num_sigma = composite_phase_cache[num_phase]["sigma"].copy()
+                den_sigma = composite_phase_cache[den_phase]["sigma"].copy()
+
+                if amplitude_bias_num is not None:
+                    num_meas = _apply_bias(
+                        num_meas, amplitude_bias_num, "amplitude_bias_num"
+                    )
+                if amplitude_bias_den is not None:
+                    den_meas = _apply_bias(
+                        den_meas, amplitude_bias_den, "amplitude_bias_den"
+                    )
+
+                ratio_meas = np.abs(
+                    np.clip(num_meas, 1e-12, np.inf) / np.clip(den_meas, 1e-12, np.inf)
+                )
+                measured = ratio_meas.reshape(-1, 1)
+                error = np.column_stack([ratio_meas * num_sigma, den_sigma])
+
+                event[key_str] = {
+                    "Measured": measured,
+                    "Error": error,
+                    "Stations": _copy_stations(),
+                }
+                continue
+
             num_amp = np.asarray(
                 forward_amplitude(true_mt6, stations_base, num_phase.upper()),
                 dtype=float,
@@ -1009,8 +1278,16 @@ def generate_synthetic_event_data(
             ).reshape(-1)
 
             # Apply per-phase biases first (P/SH/SV)
-            num_amp = _apply_bias(num_amp, phase_bias.get(num_phase), f"amplitude_bias_{num_phase.upper()}")
-            den_amp = _apply_bias(den_amp, phase_bias.get(den_phase), f"amplitude_bias_{den_phase.upper()}")
+            num_amp = _apply_bias(
+                num_amp,
+                phase_bias.get(num_phase),
+                f"amplitude_bias_{num_phase.upper()}",
+            )
+            den_amp = _apply_bias(
+                den_amp,
+                phase_bias.get(den_phase),
+                f"amplitude_bias_{den_phase.upper()}",
+            )
 
             # Optional per-station random biases (lognormal) to mimic site/path
             # effects in a realistic way.
@@ -1101,20 +1378,10 @@ def generate_synthetic_event_data(
                 measured = np.column_stack([meas_num, meas_den])
                 error = np.column_stack([err_num, err_den])
 
-            stations = {
-                "Azimuth": azimuth.copy(),
-                "TakeOffAngle": takeoff.copy(),
-                "Name": list(station_names),
-            }
-            if "Azimuth_err" in stations_base:
-                stations["Azimuth_err"] = stations_base["Azimuth_err"].copy()
-            if "TakeOff_err" in stations_base:
-                stations["TakeOff_err"] = stations_base["TakeOff_err"].copy()
-
             event[key_str] = {
                 "Measured": measured,
                 "Error": error,
-                "Stations": stations,
+                "Stations": _copy_stations(),
             }
 
     return event
@@ -1123,6 +1390,7 @@ def generate_synthetic_event_data(
 # ------------------------------------------------------------------
 # Helper functions moved from synthetic_event.py
 # ------------------------------------------------------------------
+
 
 def project_to_dc_mt6(mt33: np.ndarray) -> np.ndarray:
     """

@@ -282,14 +282,19 @@ def run(
     # ------------------------------------------------------------------
     # MT quality score
     # ------------------------------------------------------------------
-    quality = mt_quality_score(result_obj.idata, mt6_samples, mt6_mode)
+    quality = mt_quality_score(
+        mt6_samples,
+        mt6_mode,
+        final_weights=result_obj.weights,
+        n_particles=result_obj.weights.shape[-1],
+    )
     print("\nMT quality score (0–1):")
     print(f"  Q              = {quality['Q']:.3f}  ({quality['quality_label']})")
     print(f"  s_conv         = {quality['s_conv']:.3f}")
     print(f"  s_angle        = {quality['s_angle']:.3f}")
     print(f"  s_modes        = {quality['s_modes']:.3f}")
-    print(f"  rhat_max       = {quality['rhat_max']:.3f}")
-    print(f"  ess_min        = {quality['ess_min']:.1f}")
+    print(f"  ess_weights    = {quality['ess_weights']:.1f}")
+    print(f"  ess_ratio      = {quality['ess_ratio']:.3f}")
     print(f"  q50 (deg)      = {quality['q50']:.2f}")
     print(f"  q90 (deg)      = {quality['q90']:.2f}")
     print(f"  top_mode_weight= {quality['top_mode_weight']:.3f}")
@@ -306,8 +311,8 @@ def run(
         's_conv': quality['s_conv'],
         's_angle': quality['s_angle'],
         's_modes': quality['s_modes'],
-        'rhat_max': quality['rhat_max'],
-        'ess_min': quality['ess_min'],
+        'ess_weights': quality['ess_weights'],
+        'ess_ratio': quality['ess_ratio'],
         'q50_deg': quality['q50'],
         'q90_deg': quality['q90'],
         'top_mode_weight': quality['top_mode_weight'],
