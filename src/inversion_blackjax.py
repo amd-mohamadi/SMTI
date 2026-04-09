@@ -5,7 +5,7 @@ This is an experimental alternative to the PyMC/PyTensor-based InversionPyTensor
 It uses BlackJAX's adaptive tempered SMC sampler with JAX for JIT compilation.
 
 Key advantages:
-- Pure JAX implementation enables GPU acceleration
+- Pure JAX implementation supports GPU or CPU execution
 - Faster compilation (no PyTensor compile cache issues)
 - All sampling logic is JIT-compiled
 """
@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Union
+import multiprocessing as mp
+import queue
+import re
+import shutil
 import time
 
 import numpy as np
@@ -52,6 +56,61 @@ from .data_prep import (
 
 DataDict = Dict[str, Any]
 _SMALL_NUMBER = 1e-10
+
+
+def _blackjax_process_chain_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Run one BlackJAX chain in a spawned CPU process."""
+    import jax
+
+    if payload.get("chain_device") == "cpu":
+        jax.config.update("jax_platform_name", "cpu")
+
+    sampler = InversionBlackJAX(
+        data=payload["event"],
+        inversion_options=payload["inversion_options"],
+        num_particles=payload["num_particles"],
+        dc=payload["dc"],
+        random_seed=payload["seed"],
+        location_samples_n=payload["location_samples_n"],
+        azimuth_error=payload["azimuth_error"],
+        takeoff_error=payload["takeoff_error"],
+        gamma_beta_prior=payload["gamma_beta_prior"],
+        delta_beta_prior=payload["delta_beta_prior"],
+        amp_ratio_sigma_prior=payload["amp_ratio_sigma_prior"],
+        num_mcmc_steps=payload["num_mcmc_steps"],
+        mcmc_kernel=payload["mcmc_kernel"],
+        rmh_proposal_scale=payload["rmh_proposal_scale"],
+        mechanism_steps=payload["mechanism_steps"],
+        nuts_adapt_steps=payload["nuts_adapt_steps"],
+        nuts_initial_step_size=payload["nuts_initial_step_size"],
+        nuts_target_acceptance=payload["nuts_target_acceptance"],
+        nuts_max_num_doublings=payload["nuts_max_num_doublings"],
+        smc_target_ess_ratio=payload["smc_target_ess_ratio"],
+        max_smc_iterations=payload["max_smc_iterations"],
+        use_nuts_adaptation=payload["use_nuts_adaptation"],
+        adapt_proposal=payload["adapt_proposal"],
+        min_tempering_increment=payload["min_tempering_increment"],
+        tempering_stall_patience=payload["tempering_stall_patience"],
+        smc_method=payload["smc_method"],
+        ps_target_ess=payload["ps_target_ess"],
+        num_chains=1,
+        chain_execution="sequential",
+        chain_device=payload.get("chain_device", "default"),
+    )
+    progress_queue = payload.get("progress_queue")
+
+    def _progress_callback(message: str) -> None:
+        if progress_queue is not None:
+            progress_queue.put(
+                {"chain_idx": payload["chain_idx"], "text": str(message)}
+            )
+
+    result = sampler._invert_single_event(
+        payload["event"],
+        location_samples=payload["location_samples"],
+        progress_callback=_progress_callback,
+    )
+    return sampler._serialize_chain_result(result)
 
 
 @dataclass
@@ -115,6 +174,12 @@ class InversionBlackJAX:
         Beta prior parameters for gamma.
     delta_beta_prior : tuple, default (1.0, 1.0)
         Beta prior parameters for delta.
+    num_chains : int, default 4
+        Number of chains. By default, BlackJAX runs four chains.
+    chain_execution : {"sequential", "process"}, default "process"
+        Chain execution backend. By default, multi-chain runs use one process per chain.
+    chain_device : {"default", "cpu"}, default "cpu"
+        Device routing for the chain backend. By default, the multi-chain backend targets CPU.
     """
 
     def __init__(
@@ -132,7 +197,7 @@ class InversionBlackJAX:
         amp_ratio_sigma_prior: float = 5.0,
         num_mcmc_steps: int = 5,
         mcmc_kernel: str = "rmh",
-        rmh_proposal_scale: float = 0.02,
+        rmh_proposal_scale: float = 0.1,
         nuts_adapt_steps: int = 500,
         nuts_initial_step_size: float = 1e-2,
         nuts_target_acceptance: float = 0.8,
@@ -145,7 +210,7 @@ class InversionBlackJAX:
         tempering_stall_patience: int = 8,
         smc_method: str = "adaptive_tempered",
         ps_target_ess: float = 5.0,
-        mechanism_steps: int = 1,
+        mechanism_steps: int = 3,
         **kwargs: Any,
     ) -> None:
         # Normalize data to a list
@@ -195,9 +260,34 @@ class InversionBlackJAX:
             )
         self.ps_target_ess = float(ps_target_ess)
         self.mechanism_steps = int(mechanism_steps)
-        self.num_chains = int(kwargs.pop("num_chains", 1))
+        self.num_chains = int(kwargs.pop("num_chains", 4))
         if self.num_chains < 1:
             raise ValueError("num_chains must be >= 1")
+        chain_execution = kwargs.pop("chain_execution", None)
+        if chain_execution is None:
+            chain_execution = "process" if self.num_chains > 1 else "sequential"
+        self.chain_execution = str(chain_execution).lower()
+        if self.chain_execution not in {"sequential", "process"}:
+            raise ValueError("chain_execution must be one of {'sequential', 'process'}")
+        self.chain_device = str(kwargs.pop("chain_device", "cpu")).lower()
+        if self.chain_device not in {"default", "cpu"}:
+            raise ValueError("chain_device must be one of {'default', 'cpu'}")
+        chain_cores = kwargs.pop("chain_cores", None)
+        if chain_cores is None:
+            self.chain_cores = (
+                self.num_chains if self.chain_execution == "process" else None
+            )
+        else:
+            self.chain_cores = int(chain_cores)
+            if self.chain_cores <= 0:
+                raise ValueError("chain_cores must be >= 1")
+        if self.chain_execution == "process":
+            if self.num_chains <= 1:
+                raise ValueError("chain_execution='process' requires num_chains > 1")
+            if self.chain_device != "cpu":
+                raise ValueError(
+                    "chain_execution='process' currently requires chain_device='cpu'"
+                )
 
         self.rng = np.random.default_rng(self.random_seed)
         self.results: Optional[InversionResult] = None
@@ -234,6 +324,230 @@ class InversionBlackJAX:
                 filtered[key] = value
         return filtered
 
+    @staticmethod
+    def _serialize_chain_result(result: InversionResult) -> Dict[str, Any]:
+        return {
+            "mt6": np.asarray(result.mt6, dtype=float),
+            "gamma": np.asarray(result.gamma, dtype=float),
+            "delta": np.asarray(result.delta, dtype=float),
+            "kappa": np.asarray(result.kappa, dtype=float),
+            "h": np.asarray(result.h, dtype=float),
+            "sigma": np.asarray(result.sigma, dtype=float),
+            "weights": np.asarray(result.weights, dtype=float),
+            "sigma_amp_ratio": (
+                None
+                if result.sigma_amp_ratio is None
+                else np.asarray(result.sigma_amp_ratio, dtype=float)
+            ),
+        }
+
+    @staticmethod
+    def _deserialize_chain_result(payload: Dict[str, Any]) -> InversionResult:
+        return InversionResult(
+            mt6=np.asarray(payload["mt6"], dtype=float),
+            gamma=np.asarray(payload["gamma"], dtype=float),
+            delta=np.asarray(payload["delta"], dtype=float),
+            kappa=np.asarray(payload["kappa"], dtype=float),
+            h=np.asarray(payload["h"], dtype=float),
+            sigma=np.asarray(payload["sigma"], dtype=float),
+            ln_p=None,
+            weights=np.asarray(payload["weights"], dtype=float),
+            idata=None,
+            sigma_amp_ratio=(
+                None
+                if payload.get("sigma_amp_ratio") is None
+                else np.asarray(payload["sigma_amp_ratio"], dtype=float)
+            ),
+        )
+
+    @staticmethod
+    def _summarize_process_status(status: str) -> str:
+        text = " ".join(str(status).split())
+        if not text:
+            return "waiting"
+
+        lower = text.lower()
+        if lower.startswith("smc completed in"):
+            match = re.search(r"completed in\s+([0-9.]+)s", text, re.IGNORECASE)
+            if match is not None:
+                return f"done {float(match.group(1)):.1f}s"
+            return "done"
+
+        if lower.startswith("smc tempering stalled"):
+            return "stalled"
+
+        if lower.startswith("init"):
+            return "init"
+
+        match = re.search(
+            r"(?:stage\s*=\s*|stage\s+)(\d+)(?::)?\s+beta\s*=\s*([0-9.]+)",
+            text,
+            re.IGNORECASE,
+        )
+        if match is not None:
+            stage = int(match.group(1))
+            beta = float(match.group(2))
+            beta_token = f"{beta:.3f}".lstrip("0")
+            ess_match = re.search(r"\bESS\s*=\s*([0-9.]+)", text)
+            pess_match = re.search(r"\bpESS\s*=\s*([0-9.]+)", text)
+            ess_token = ""
+            if ess_match is not None:
+                ess_token = f" e{int(float(ess_match.group(1)))}"
+            elif pess_match is not None:
+                ess_token = f" p{int(float(pess_match.group(1)))}"
+            return f"S{stage} {beta_token}{ess_token}"
+
+        return text
+
+    @staticmethod
+    def _truncate_process_status(text: str, max_len: int) -> str:
+        if max_len <= 0:
+            return ""
+        if len(text) <= max_len:
+            return text
+        if max_len <= 3:
+            return "." * max_len
+        return text[: max_len - 3] + "..."
+
+    @classmethod
+    def _format_process_status_line(
+        cls,
+        statuses: Dict[int, str],
+        num_chains: int,
+        max_columns: Optional[int] = None,
+    ) -> str:
+        parts = []
+        for chain_idx in range(num_chains):
+            status = cls._summarize_process_status(statuses.get(chain_idx, "waiting"))
+            parts.append(f"C{chain_idx + 1} {status}")
+        line = " | ".join(parts)
+
+        if max_columns is None:
+            max_columns = shutil.get_terminal_size(fallback=(120, 20)).columns
+        if len(line) <= max_columns:
+            return line
+
+        sep = " | "
+        available = max_columns - len(sep) * (num_chains - 1)
+        if available <= num_chains:
+            return cls._truncate_process_status(line, max_columns)
+
+        part_budget = max(1, available // num_chains)
+        truncated_parts = [
+            cls._truncate_process_status(part, part_budget) for part in parts
+        ]
+        line = sep.join(truncated_parts)
+        if len(line) <= max_columns:
+            return line
+        return cls._truncate_process_status(line, max_columns)
+
+    def _build_process_chain_payloads(
+        self,
+        event: DataDict,
+        chain_seeds: List[int],
+        location_samples: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for chain_idx, seed in enumerate(chain_seeds):
+            payloads.append(
+                {
+                    "chain_idx": chain_idx,
+                    "seed": seed,
+                    "event": event,
+                    "location_samples": location_samples,
+                    "inversion_options": self.inversion_options,
+                    "num_particles": self.num_particles,
+                    "dc": self.dc,
+                    "location_samples_n": self.location_samples_n,
+                    "azimuth_error": self.azimuth_error,
+                    "takeoff_error": self.takeoff_error,
+                    "gamma_beta_prior": self.gamma_beta_prior,
+                    "delta_beta_prior": self.delta_beta_prior,
+                    "amp_ratio_sigma_prior": self.amp_ratio_sigma_prior,
+                    "num_mcmc_steps": self.num_mcmc_steps,
+                    "mcmc_kernel": self.mcmc_kernel,
+                    "rmh_proposal_scale": self.rmh_proposal_scale,
+                    "mechanism_steps": self.mechanism_steps,
+                    "nuts_adapt_steps": self.nuts_adapt_steps,
+                    "nuts_initial_step_size": self.nuts_initial_step_size,
+                    "nuts_target_acceptance": self.nuts_target_acceptance,
+                    "nuts_max_num_doublings": self.nuts_max_num_doublings,
+                    "smc_target_ess_ratio": self.smc_target_ess_ratio,
+                    "max_smc_iterations": self.max_smc_iterations,
+                    "use_nuts_adaptation": self.use_nuts_adaptation,
+                    "adapt_proposal": self.adapt_proposal,
+                    "min_tempering_increment": self.min_tempering_increment,
+                    "tempering_stall_patience": self.tempering_stall_patience,
+                    "smc_method": self.smc_method,
+                    "ps_target_ess": self.ps_target_ess,
+                    "chain_device": self.chain_device,
+                }
+            )
+        return payloads
+
+    def _run_multi_chain_process(
+        self, chain_payloads: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        ctx = mp.get_context("spawn")
+        max_workers = min(self.num_chains, self.chain_cores or self.num_chains)
+        with ctx.Manager() as manager:
+            progress_queue = manager.Queue()
+            with ctx.Pool(processes=max_workers) as pool:
+                async_results = []
+                for payload in chain_payloads:
+                    worker_payload = dict(payload)
+                    worker_payload["progress_queue"] = progress_queue
+                    async_results.append(
+                        (
+                            payload["chain_idx"],
+                            pool.apply_async(
+                                _blackjax_process_chain_worker, (worker_payload,)
+                            ),
+                        )
+                    )
+
+                ordered: List[Optional[Dict[str, Any]]] = [None] * len(async_results)
+                status_by_chain: Dict[int, str] = {}
+                printed_len = 0
+
+                def _drain_progress_queue() -> None:
+                    nonlocal printed_len
+                    updated = False
+                    while True:
+                        try:
+                            msg = progress_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        status_by_chain[int(msg["chain_idx"])] = str(msg["text"])
+                        updated = True
+                    if updated:
+                        line = self._format_process_status_line(
+                            status_by_chain, self.num_chains
+                        )
+                        printed_len = max(printed_len, len(line))
+                        print(line.ljust(printed_len), end="\r", flush=True)
+
+                while True:
+                    _drain_progress_queue()
+                    if all(async_result.ready() for _, async_result in async_results):
+                        break
+                    time.sleep(0.05)
+
+                _drain_progress_queue()
+                if status_by_chain:
+                    line = self._format_process_status_line(
+                        status_by_chain, self.num_chains
+                    )
+                    printed_len = max(printed_len, len(line))
+                    print(line.ljust(printed_len), flush=True)
+
+                for chain_idx, async_result in async_results:
+                    try:
+                        ordered[chain_idx] = async_result.get()
+                    except Exception as exc:
+                        raise RuntimeError(f"chain {chain_idx} failed: {exc}") from exc
+        return [payload for payload in ordered if payload is not None]
+
     def _invert_multi_chain(self, event: DataDict) -> InversionResult:
         """Run multiple independent SMC chains and stack results."""
         ss = np.random.SeedSequence(self.random_seed)
@@ -249,20 +563,31 @@ class InversionBlackJAX:
             takeoff_error=self.takeoff_error,
         )
 
+        chain_payloads = self._build_process_chain_payloads(
+            event, chain_seeds, location_samples
+        )
+
         chain_results: List[InversionResult] = []
         original_seed = self.random_seed
         original_rng = self.rng
 
-        for chain_idx, seed in enumerate(chain_seeds):
-            print(
-                f"\n{'=' * 40} Chain {chain_idx + 1}/{self.num_chains} "
-                f"(seed={seed}) {'=' * 40}"
-            )
-            self.random_seed = seed
-            self.rng = np.random.default_rng(seed)
-            chain_results.append(
-                self._invert_single_event(event, location_samples=location_samples)
-            )
+        if self.chain_execution == "process":
+            serialized_results = self._run_multi_chain_process(chain_payloads)
+            chain_results = [
+                self._deserialize_chain_result(payload)
+                for payload in serialized_results
+            ]
+        else:
+            for chain_idx, seed in enumerate(chain_seeds):
+                print(
+                    f"\n{'=' * 40} Chain {chain_idx + 1}/{self.num_chains} "
+                    f"(seed={seed}) {'=' * 40}"
+                )
+                self.random_seed = seed
+                self.rng = np.random.default_rng(seed)
+                chain_results.append(
+                    self._invert_single_event(event, location_samples=location_samples)
+                )
 
         self.random_seed = original_seed
         self.rng = original_rng
@@ -334,9 +659,16 @@ class InversionBlackJAX:
         self,
         event: DataDict,
         location_samples: Optional[List[Dict[str, Any]]] = None,
+        progress_callback: Optional[Any] = None,
     ) -> InversionResult:
         """Run SMC inversion for a single event."""
         start_time = time.time()
+
+        def _emit_progress(message: str) -> None:
+            if progress_callback is None:
+                print(message)
+            else:
+                progress_callback(message)
 
         # --- Prepare Data ---
         has_pol = any(
@@ -686,7 +1018,7 @@ class InversionBlackJAX:
         ll_max = (
             float(np.max(init_ll[finite_mask])) if np.any(finite_mask) else float("nan")
         )
-        print(
+        _emit_progress(
             "Initial particle log-likelihood stats: "
             f"finite={finite_frac:.3f}, min={ll_min:.3f}, max={ll_max:.3f}"
         )
@@ -694,7 +1026,7 @@ class InversionBlackJAX:
         use_blockwise = False  # Only enabled for RMH with adapt_proposal
 
         if self.mcmc_kernel == "nuts":
-            print("Adapting NUTS parameters (window adaptation)...")
+            _emit_progress("Adapting NUTS parameters (window adaptation)...")
             init_position = jax.tree.map(lambda x: x[0], initial_particles)
             warmup = blackjax.window_adaptation(
                 blackjax.nuts,
@@ -748,7 +1080,7 @@ class InversionBlackJAX:
                 )
 
             mcmc_init_fn = blackjax.nuts.init
-            print("Using BlackJAX SMC rejuvenation kernel: NUTS")
+            _emit_progress("Using BlackJAX SMC rejuvenation kernel: NUTS")
         else:
             rmh_kernel = blackjax_rw.build_additive_step()
             mcmc_init_fn = blackjax.rmh.init
@@ -789,7 +1121,7 @@ class InversionBlackJAX:
                 block_names_str = ", ".join(
                     f"{b.name}(x{inner_steps.get(b.name, 1)})" for b in blocks
                 )
-                print(f"Using MWG kernel: blocks=[{block_names_str}]")
+                _emit_progress(f"Using MWG kernel: blocks=[{block_names_str}]")
             else:
                 # --- Standard isotropic RMH ---
                 proposal_scale = jnp.array(self.rmh_proposal_scale, dtype=jnp.float64)
@@ -801,7 +1133,7 @@ class InversionBlackJAX:
                     random_step = blackjax_rw.normal(proposal_scale)
                     return rmh_kernel(rng_key, state, logdensity_fn, random_step)
 
-                print(
+                _emit_progress(
                     f"Using BlackJAX SMC rejuvenation kernel: RMH (proposal_scale={float(proposal_scale):.4f})"
                 )
 
@@ -825,7 +1157,7 @@ class InversionBlackJAX:
                     {"_unused_scale": jnp.array(0.0)}
                 )
                 mcmc_step_fn = mcmc_step_fn_persistent
-                print(
+                _emit_progress(
                     "Note: persistent sampling uses MWG with fixed scales (no adaptation)"
                 )
 
@@ -878,7 +1210,9 @@ class InversionBlackJAX:
         method_name = (
             "adaptive persistent SMC" if use_persistent else "adaptive tempered SMC"
         )
-        print(f"Running BlackJAX {method_name} ({self.mcmc_kernel.upper()})...")
+        _emit_progress(
+            f"Running BlackJAX {method_name} ({self.mcmc_kernel.upper()})..."
+        )
         smc_st = _get_smc_state(state)
         prev_beta = float(smc_st.tempering_param)
         stall_count = 0
@@ -936,11 +1270,11 @@ class InversionBlackJAX:
                     acc_rate = None
 
             if acc_rate is None:
-                print(
+                _emit_progress(
                     f"  Stage {iteration + 1}: beta={curr_beta:.4f} (d={delta_beta:.5f}), {ess_str}"
                 )
             else:
-                print(
+                _emit_progress(
                     f"  Stage {iteration + 1}: beta={curr_beta:.4f} (d={delta_beta:.5f}), "
                     f"{ess_str}, acc={acc_rate:.3f}"
                 )
@@ -950,7 +1284,7 @@ class InversionBlackJAX:
             else:
                 stall_count = 0
             if stall_count >= self.tempering_stall_patience:
-                print(
+                _emit_progress(
                     "SMC tempering stalled "
                     f"(delta_beta < {self.min_tempering_increment:.1e} for {stall_count} stages). "
                     "Stopping early."
@@ -959,7 +1293,7 @@ class InversionBlackJAX:
 
         elapsed = time.time() - start_time
         smc_st = _get_smc_state(state)
-        print(
+        _emit_progress(
             f"SMC completed in {elapsed:.2f}s with beta={float(smc_st.tempering_param):.4f}"
         )
 
