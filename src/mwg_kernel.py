@@ -142,7 +142,7 @@ def build_mwg_parameter_update_fn(
         Same as in the main inversion code.
     target_acceptance_by_block : dict, optional
         Target acceptance rate per block name. Defaults:
-        ``source_type=0.44, mechanism=0.234, noise=0.44``.
+        ``source_type=0.234, mechanism=0.234, noise=0.234``.
         Note: mechanism target is lower (Roberts et al. optimal for d=3).
     adaptation_rate : float
         Controls how aggressively scales adapt. 1.5 is a good default.
@@ -157,9 +157,9 @@ def build_mwg_parameter_update_fn(
 
     # Default targets: use Roberts-Rosenthal optimal rates per dimension
     default_targets = {
-        "source_type": 0.44,   # d=2
+        "source_type": 0.234,   # d=2
         "mechanism": 0.234,    # d=3 (the classic 0.234 rate)
-        "noise": 0.44,         # d=1
+        "noise": 0.234,         # d=1
     }
     if target_acceptance_by_block is not None:
         default_targets.update(target_acceptance_by_block)
