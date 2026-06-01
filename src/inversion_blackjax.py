@@ -18,6 +18,7 @@ import multiprocessing as mp
 import queue
 import re
 import shutil
+import sys
 import time
 
 import numpy as np
@@ -229,7 +230,11 @@ class InversionBlackJAX:
 
         self.num_particles = int(num_particles)
         self.dc = bool(dc)
-        self.random_seed = random_seed if random_seed is not None else 42
+        self.random_seed = (
+            int(random_seed)
+            if random_seed is not None
+            else int(np.random.SeedSequence().generate_state(1)[0])
+        )
         self.location_samples_n = int(location_samples_n)
         self.azimuth_error = azimuth_error
         self.takeoff_error = takeoff_error
@@ -376,8 +381,11 @@ class InversionBlackJAX:
         if lower.startswith("smc tempering stalled"):
             return "stalled"
 
+        if lower.startswith("initial particle log-likelihood stats"):
+            return text.replace("Initial particle log-likelihood stats: ", "init ll ")
+
         if lower.startswith("init"):
-            return "init"
+            return text
 
         match = re.search(
             r"(?:stage\s*=\s*|stage\s+)(\d+)(?::)?\s+beta\s*=\s*([0-9.]+)",
@@ -387,15 +395,19 @@ class InversionBlackJAX:
         if match is not None:
             stage = int(match.group(1))
             beta = float(match.group(2))
-            beta_token = f"{beta:.3f}".lstrip("0")
+            beta_token = f"beta={beta:.4f}"
             ess_match = re.search(r"\bESS\s*=\s*([0-9.]+)", text)
             pess_match = re.search(r"\bpESS\s*=\s*([0-9.]+)", text)
+            acc_match = re.search(r"\bacc\s*=\s*([0-9.]+)", text)
             ess_token = ""
             if ess_match is not None:
-                ess_token = f" e{int(float(ess_match.group(1)))}"
+                ess_token = f" ESS={int(float(ess_match.group(1)))}"
             elif pess_match is not None:
-                ess_token = f" p{int(float(pess_match.group(1)))}"
-            return f"S{stage} {beta_token}{ess_token}"
+                ess_token = f" pESS={int(float(pess_match.group(1)))}"
+            acc_token = ""
+            if acc_match is not None:
+                acc_token = f" acc={float(acc_match.group(1)):.3f}"
+            return f"S{stage} {beta_token}{ess_token}{acc_token}"
 
         return text
 
@@ -416,30 +428,15 @@ class InversionBlackJAX:
         num_chains: int,
         max_columns: Optional[int] = None,
     ) -> str:
-        parts = []
-        for chain_idx in range(num_chains):
-            status = cls._summarize_process_status(statuses.get(chain_idx, "waiting"))
-            parts.append(f"C{chain_idx + 1} {status}")
-        line = " | ".join(parts)
-
         if max_columns is None:
             max_columns = shutil.get_terminal_size(fallback=(120, 20)).columns
-        if len(line) <= max_columns:
-            return line
 
-        sep = " | "
-        available = max_columns - len(sep) * (num_chains - 1)
-        if available <= num_chains:
-            return cls._truncate_process_status(line, max_columns)
-
-        part_budget = max(1, available // num_chains)
-        truncated_parts = [
-            cls._truncate_process_status(part, part_budget) for part in parts
-        ]
-        line = sep.join(truncated_parts)
-        if len(line) <= max_columns:
-            return line
-        return cls._truncate_process_status(line, max_columns)
+        lines = []
+        for chain_idx in range(num_chains):
+            status = cls._summarize_process_status(statuses.get(chain_idx, "waiting"))
+            line = f"C{chain_idx + 1} {status}"
+            lines.append(cls._truncate_process_status(line, max_columns))
+        return "\n".join(lines)
 
     def _build_process_chain_payloads(
         self,
@@ -490,6 +487,15 @@ class InversionBlackJAX:
     ) -> List[Dict[str, Any]]:
         ctx = mp.get_context("spawn")
         max_workers = min(self.num_chains, self.chain_cores or self.num_chains)
+        status_by_chain: Dict[int, str] = {
+            payload["chain_idx"]: f"starting seed={payload['seed']}"
+            for payload in chain_payloads
+        }
+        initial_block = self._format_process_status_line(
+            status_by_chain, self.num_chains
+        )
+        print(initial_block, flush=True)
+        printed_lines = initial_block.count("\n") + 1
         with ctx.Manager() as manager:
             progress_queue = manager.Queue()
             with ctx.Pool(processes=max_workers) as pool:
@@ -507,11 +513,17 @@ class InversionBlackJAX:
                     )
 
                 ordered: List[Optional[Dict[str, Any]]] = [None] * len(async_results)
-                status_by_chain: Dict[int, str] = {}
-                printed_len = 0
+
+                def _print_progress_block(block: str, final: bool = False) -> None:
+                    nonlocal printed_lines
+                    if sys.stdout.isatty() and printed_lines:
+                        print(f"\033[{printed_lines}F\033[J", end="")
+                    print(block, flush=True)
+                    printed_lines = block.count("\n") + 1
+                    if final:
+                        printed_lines = 0
 
                 def _drain_progress_queue() -> None:
-                    nonlocal printed_len
                     updated = False
                     while True:
                         try:
@@ -521,11 +533,10 @@ class InversionBlackJAX:
                         status_by_chain[int(msg["chain_idx"])] = str(msg["text"])
                         updated = True
                     if updated:
-                        line = self._format_process_status_line(
+                        block = self._format_process_status_line(
                             status_by_chain, self.num_chains
                         )
-                        printed_len = max(printed_len, len(line))
-                        print(line.ljust(printed_len), end="\r", flush=True)
+                        _print_progress_block(block)
 
                 while True:
                     _drain_progress_queue()
@@ -535,11 +546,10 @@ class InversionBlackJAX:
 
                 _drain_progress_queue()
                 if status_by_chain:
-                    line = self._format_process_status_line(
+                    block = self._format_process_status_line(
                         status_by_chain, self.num_chains
                     )
-                    printed_len = max(printed_len, len(line))
-                    print(line.ljust(printed_len), flush=True)
+                    _print_progress_block(block, final=True)
 
                 for chain_idx, async_result in async_results:
                     try:
@@ -669,6 +679,8 @@ class InversionBlackJAX:
                 print(message)
             else:
                 progress_callback(message)
+
+        _emit_progress("Preparing data and likelihood matrices...")
 
         # --- Prepare Data ---
         has_pol = any(
@@ -960,6 +972,7 @@ class InversionBlackJAX:
             return jnp.nan_to_num(log_lik, nan=-1.0e3, posinf=1.0e3, neginf=-1.0e3)
 
         # --- Initialize Particles (unconstrained space) ---
+        _emit_progress("Initializing particles and evaluating initial likelihood...")
         key = random.PRNGKey(self.random_seed)
 
         def init_particle(key):
