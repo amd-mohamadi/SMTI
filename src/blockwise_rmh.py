@@ -35,13 +35,17 @@ def _require_known_fields(
         )
 
 
-def default_rmh_blocks(dc: bool, has_ar: bool) -> tuple[RMHBlock, ...]:
+def default_rmh_blocks(
+    dc: bool,
+    has_ar: bool,
+    noise_fields: tuple[str, ...] | None = None,
+) -> tuple[RMHBlock, ...]:
     blocks = []
     if not dc:
         blocks.append(RMHBlock("source_type", ("gamma", "delta")))
     blocks.append(RMHBlock("mechanism", ("kappa", "h", "sigma")))
     if has_ar:
-        blocks.append(RMHBlock("noise", ("sigma_amp_ratio",)))
+        blocks.append(RMHBlock("noise", noise_fields or ("sigma_amp_ratio",)))
     return tuple(blocks)
 
 

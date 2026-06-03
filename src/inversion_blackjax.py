@@ -78,6 +78,11 @@ def _blackjax_process_chain_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         gamma_beta_prior=payload["gamma_beta_prior"],
         delta_beta_prior=payload["delta_beta_prior"],
         amp_ratio_sigma_prior=payload["amp_ratio_sigma_prior"],
+        amp_ratio_noise_mode=payload["amp_ratio_noise_mode"],
+        amp_ratio_station_log_scale=payload["amp_ratio_station_log_scale"],
+        amp_ratio_smooth_length_deg=payload["amp_ratio_smooth_length_deg"],
+        amp_ratio_smooth_k=payload["amp_ratio_smooth_k"],
+        amp_ratio_smooth_strength=payload["amp_ratio_smooth_strength"],
         num_mcmc_steps=payload["num_mcmc_steps"],
         mcmc_kernel=payload["mcmc_kernel"],
         rmh_proposal_scale=payload["rmh_proposal_scale"],
@@ -143,6 +148,9 @@ class InversionResult:
     weights: np.ndarray
     idata: Any
     sigma_amp_ratio: Optional[np.ndarray] = None
+    sigma_amp_ratio_global: Optional[np.ndarray] = None
+    sigma_amp_ratio_station: Optional[np.ndarray] = None
+    sigma_amp_ratio_station_names: Optional[np.ndarray] = None
     num_chains: int = 1
 
 
@@ -196,6 +204,11 @@ class InversionBlackJAX:
         gamma_beta_prior: tuple = (1.0, 1.0),
         delta_beta_prior: tuple = (1.0, 1.0),
         amp_ratio_sigma_prior: float = 5.0,
+        amp_ratio_noise_mode: str = "global",
+        amp_ratio_station_log_scale: float = 0.3,
+        amp_ratio_smooth_length_deg: float = 30.0,
+        amp_ratio_smooth_k: int = 4,
+        amp_ratio_smooth_strength: float = 1.0,
         num_mcmc_steps: int = 5,
         mcmc_kernel: str = "rmh",
         rmh_proposal_scale: float = 0.1,
@@ -241,6 +254,23 @@ class InversionBlackJAX:
         self.gamma_beta_prior = gamma_beta_prior
         self.delta_beta_prior = delta_beta_prior
         self.amp_ratio_sigma_prior = amp_ratio_sigma_prior
+        self.amp_ratio_noise_mode = str(amp_ratio_noise_mode).lower()
+        if self.amp_ratio_noise_mode not in {"global", "station_smooth"}:
+            raise ValueError(
+                "amp_ratio_noise_mode must be one of {'global', 'station_smooth'}"
+            )
+        self.amp_ratio_station_log_scale = float(amp_ratio_station_log_scale)
+        if self.amp_ratio_station_log_scale <= 0.0:
+            raise ValueError("amp_ratio_station_log_scale must be > 0.")
+        self.amp_ratio_smooth_length_deg = float(amp_ratio_smooth_length_deg)
+        if self.amp_ratio_smooth_length_deg <= 0.0:
+            raise ValueError("amp_ratio_smooth_length_deg must be > 0.")
+        self.amp_ratio_smooth_k = int(amp_ratio_smooth_k)
+        if self.amp_ratio_smooth_k < 0:
+            raise ValueError("amp_ratio_smooth_k must be >= 0.")
+        self.amp_ratio_smooth_strength = float(amp_ratio_smooth_strength)
+        if self.amp_ratio_smooth_strength < 0.0:
+            raise ValueError("amp_ratio_smooth_strength must be >= 0.")
         self.num_mcmc_steps = num_mcmc_steps
         self.mcmc_kernel = str(mcmc_kernel).lower()
         if self.mcmc_kernel not in {"rmh", "nuts"}:
@@ -344,6 +374,21 @@ class InversionBlackJAX:
                 if result.sigma_amp_ratio is None
                 else np.asarray(result.sigma_amp_ratio, dtype=float)
             ),
+            "sigma_amp_ratio_global": (
+                None
+                if result.sigma_amp_ratio_global is None
+                else np.asarray(result.sigma_amp_ratio_global, dtype=float)
+            ),
+            "sigma_amp_ratio_station": (
+                None
+                if result.sigma_amp_ratio_station is None
+                else np.asarray(result.sigma_amp_ratio_station, dtype=float)
+            ),
+            "sigma_amp_ratio_station_names": (
+                None
+                if result.sigma_amp_ratio_station_names is None
+                else np.asarray(result.sigma_amp_ratio_station_names, dtype=object)
+            ),
         }
 
     @staticmethod
@@ -362,6 +407,21 @@ class InversionBlackJAX:
                 None
                 if payload.get("sigma_amp_ratio") is None
                 else np.asarray(payload["sigma_amp_ratio"], dtype=float)
+            ),
+            sigma_amp_ratio_global=(
+                None
+                if payload.get("sigma_amp_ratio_global") is None
+                else np.asarray(payload["sigma_amp_ratio_global"], dtype=float)
+            ),
+            sigma_amp_ratio_station=(
+                None
+                if payload.get("sigma_amp_ratio_station") is None
+                else np.asarray(payload["sigma_amp_ratio_station"], dtype=float)
+            ),
+            sigma_amp_ratio_station_names=(
+                None
+                if payload.get("sigma_amp_ratio_station_names") is None
+                else np.asarray(payload["sigma_amp_ratio_station_names"], dtype=object)
             ),
         )
 
@@ -461,6 +521,11 @@ class InversionBlackJAX:
                     "gamma_beta_prior": self.gamma_beta_prior,
                     "delta_beta_prior": self.delta_beta_prior,
                     "amp_ratio_sigma_prior": self.amp_ratio_sigma_prior,
+                    "amp_ratio_noise_mode": self.amp_ratio_noise_mode,
+                    "amp_ratio_station_log_scale": self.amp_ratio_station_log_scale,
+                    "amp_ratio_smooth_length_deg": self.amp_ratio_smooth_length_deg,
+                    "amp_ratio_smooth_k": self.amp_ratio_smooth_k,
+                    "amp_ratio_smooth_strength": self.amp_ratio_smooth_strength,
                     "num_mcmc_steps": self.num_mcmc_steps,
                     "mcmc_kernel": self.mcmc_kernel,
                     "rmh_proposal_scale": self.rmh_proposal_scale,
@@ -625,6 +690,12 @@ class InversionBlackJAX:
                     return w
                 return np.concatenate([w, np.zeros(target_len - w.size)])
 
+            def _pad_sample_axis(arr, target_len):
+                if arr.shape[0] == target_len:
+                    return arr
+                pad = np.repeat(arr[-1:, ...], target_len - arr.shape[0], axis=0)
+                return np.concatenate([arr, pad], axis=0)
+
             padded = []
             for r in chain_results:
                 padded.append(
@@ -643,6 +714,17 @@ class InversionBlackJAX:
                             if r.sigma_amp_ratio is not None
                             else None
                         ),
+                        sigma_amp_ratio_global=(
+                            _pad_1d(r.sigma_amp_ratio_global, max_n)
+                            if r.sigma_amp_ratio_global is not None
+                            else None
+                        ),
+                        sigma_amp_ratio_station=(
+                            _pad_sample_axis(r.sigma_amp_ratio_station, max_n)
+                            if r.sigma_amp_ratio_station is not None
+                            else None
+                        ),
+                        sigma_amp_ratio_station_names=r.sigma_amp_ratio_station_names,
                     )
                 )
             chain_results = padded
@@ -662,8 +744,98 @@ class InversionBlackJAX:
                 if chain_results[0].sigma_amp_ratio is not None
                 else None
             ),
+            sigma_amp_ratio_global=(
+                np.stack([r.sigma_amp_ratio_global for r in chain_results], axis=0)
+                if chain_results[0].sigma_amp_ratio_global is not None
+                else None
+            ),
+            sigma_amp_ratio_station=(
+                np.stack([r.sigma_amp_ratio_station for r in chain_results], axis=0)
+                if chain_results[0].sigma_amp_ratio_station is not None
+                else None
+            ),
+            sigma_amp_ratio_station_names=chain_results[0].sigma_amp_ratio_station_names,
             num_chains=self.num_chains,
         )
+
+    @staticmethod
+    def _build_amp_ratio_station_context(
+        metadata: Dict[str, np.ndarray],
+        smooth_k: int,
+        smooth_length_deg: float,
+    ) -> Dict[str, np.ndarray]:
+        station_names_raw = [
+            str(name)
+            for name in np.asarray(metadata["station_names"], dtype=object).reshape(-1)
+        ]
+        station_az_raw = np.asarray(metadata["azimuth"], dtype=float).reshape(-1)
+        station_to_raw = np.asarray(metadata["takeoff"], dtype=float).reshape(-1)
+
+        n_obs = len(station_names_raw)
+        if n_obs == 0:
+            raise ValueError("station_smooth amplitude-ratio noise requires observations.")
+        if station_az_raw.shape[0] != n_obs or station_to_raw.shape[0] != n_obs:
+            raise ValueError(
+                "Amplitude-ratio station metadata must align with observations."
+            )
+
+        station_to_index: Dict[str, int] = {}
+        station_names: List[str] = []
+        station_azimuth: List[float] = []
+        station_takeoff: List[float] = []
+        ratio_station_index = np.empty(n_obs, dtype=np.int32)
+
+        for obs_idx, name in enumerate(station_names_raw):
+            station_idx = station_to_index.get(name)
+            if station_idx is None:
+                station_idx = len(station_names)
+                station_to_index[name] = station_idx
+                station_names.append(name)
+                station_azimuth.append(float(station_az_raw[obs_idx]))
+                station_takeoff.append(float(station_to_raw[obs_idx]))
+            ratio_station_index[obs_idx] = station_idx
+
+        station_azimuth_arr = np.asarray(station_azimuth, dtype=float)
+        station_takeoff_arr = np.asarray(station_takeoff, dtype=float)
+        n_station = station_azimuth_arr.shape[0]
+
+        edge_i: List[int] = []
+        edge_j: List[int] = []
+        edge_w: List[float] = []
+        k_eff = min(int(smooth_k), max(n_station - 1, 0))
+        if n_station > 1 and k_eff > 0:
+            az_rad = np.deg2rad(station_azimuth_arr)
+            takeoff_rad = np.deg2rad(station_takeoff_arr)
+            vectors = np.column_stack(
+                [
+                    np.sin(takeoff_rad) * np.cos(az_rad),
+                    np.sin(takeoff_rad) * np.sin(az_rad),
+                    np.cos(takeoff_rad),
+                ]
+            )
+            dot = np.clip(vectors @ vectors.T, -1.0, 1.0)
+            distances = np.arccos(dot)
+            np.fill_diagonal(distances, np.inf)
+
+            length_rad = np.deg2rad(float(smooth_length_deg))
+            for i in range(n_station):
+                for j in np.argsort(distances[i])[:k_eff]:
+                    distance = distances[i, j]
+                    if not np.isfinite(distance):
+                        continue
+                    edge_i.append(i)
+                    edge_j.append(int(j))
+                    edge_w.append(float(np.exp(-(distance**2) / (2.0 * length_rad**2))))
+
+        return {
+            "station_names": np.asarray(station_names, dtype=object),
+            "ratio_station_index": ratio_station_index,
+            "station_azimuth": station_azimuth_arr,
+            "station_takeoff": station_takeoff_arr,
+            "edge_i": np.asarray(edge_i, dtype=np.int32),
+            "edge_j": np.asarray(edge_j, dtype=np.int32),
+            "edge_w": np.asarray(edge_w, dtype=float),
+        }
 
     def _invert_single_event(
         self,
@@ -691,6 +863,7 @@ class InversionBlackJAX:
             "amplituderatio" in key.lower() or "amplitude_ratio" in key.lower()
             for key in event.keys()
         )
+        station_smooth_ar = has_ar and self.amp_ratio_noise_mode == "station_smooth"
 
         if not (has_pol or has_ar):
             raise ValueError("No supported data types found in event.")
@@ -730,13 +903,33 @@ class InversionBlackJAX:
 
         # Prepare amplitude ratio data
         if has_ar:
-            (
-                a1_ar,
-                a2_ar,
-                amplitude_ratio,
-                perc_err1,
-                perc_err2,
-            ) = amplitude_ratio_matrix(event, location_samples=location_samples)
+            if station_smooth_ar:
+                (
+                    a1_ar,
+                    a2_ar,
+                    amplitude_ratio,
+                    perc_err1,
+                    perc_err2,
+                    ar_metadata,
+                ) = amplitude_ratio_matrix(
+                    event,
+                    location_samples=location_samples,
+                    return_metadata=True,
+                )
+                ar_station_context = self._build_amp_ratio_station_context(
+                    ar_metadata,
+                    smooth_k=self.amp_ratio_smooth_k,
+                    smooth_length_deg=self.amp_ratio_smooth_length_deg,
+                )
+            else:
+                (
+                    a1_ar,
+                    a2_ar,
+                    amplitude_ratio,
+                    perc_err1,
+                    perc_err2,
+                ) = amplitude_ratio_matrix(event, location_samples=location_samples)
+                ar_station_context = None
 
             a1_ar_np = np.asarray(a1_ar, dtype=np.float64)
             a2_ar_np = np.asarray(a2_ar, dtype=np.float64)
@@ -748,6 +941,7 @@ class InversionBlackJAX:
             a1_ar_np = a2_ar_np = None
             amp_ratio_obs = None
             log_ratio_sigma = None
+            ar_station_context = None
 
         # --- Build JAX Log-Density Functions ---
 
@@ -766,9 +960,37 @@ class InversionBlackJAX:
             a2_ar_jax = jnp.asarray(a2_ar_np)
             amp_ratio_obs_jax = jnp.asarray(amp_ratio_obs)
             log_ratio_sigma_jax = jnp.asarray(log_ratio_sigma)
+            if station_smooth_ar:
+                ratio_station_index_jax = jnp.asarray(
+                    ar_station_context["ratio_station_index"]
+                )
+                edge_i_jax = jnp.asarray(ar_station_context["edge_i"])
+                edge_j_jax = jnp.asarray(ar_station_context["edge_j"])
+                edge_w_jax = jnp.asarray(ar_station_context["edge_w"])
+                n_amp_ratio_stations = int(
+                    ar_station_context["station_names"].shape[0]
+                )
+                has_smooth_edges = bool(ar_station_context["edge_i"].size > 0)
+            else:
+                ratio_station_index_jax = None
+                edge_i_jax = edge_j_jax = edge_w_jax = None
+                n_amp_ratio_stations = 0
+                has_smooth_edges = False
+        else:
+            ratio_station_index_jax = None
+            edge_i_jax = edge_j_jax = edge_w_jax = None
+            n_amp_ratio_stations = 0
+            has_smooth_edges = False
 
         dc = self.dc
         amp_ratio_sigma_prior = self.amp_ratio_sigma_prior
+        amp_ratio_station_log_scale = self.amp_ratio_station_log_scale
+        amp_ratio_smooth_strength = self.amp_ratio_smooth_strength
+        amp_ratio_noise_fields = (
+            ("sigma_amp_ratio_global", "sigma_amp_ratio_station_log_offset")
+            if station_smooth_ar
+            else ("sigma_amp_ratio",)
+        )
         eps = 1e-6
 
         def _logit(p):
@@ -806,9 +1028,20 @@ class InversionBlackJAX:
             params["h"] = h_raw
             params["sigma"] = -jnp.pi / 2.0 + s_raw * (jnp.pi)
 
-            if has_ar:
+            if station_smooth_ar:
+                u_ar = position["sigma_amp_ratio_global"]
+                sigma_global = jnn.softplus(u_ar) + eps
+                z_station = position["sigma_amp_ratio_station_log_offset"]
+                sigma_station = sigma_global[..., None] * jnp.exp(z_station)
+                params["sigma_amp_ratio"] = sigma_global
+                params["sigma_amp_ratio_global"] = sigma_global
+                params["sigma_amp_ratio_station_log_offset"] = z_station
+                params["sigma_amp_ratio_station"] = sigma_station
+            elif has_ar:
                 u_ar = position["sigma_amp_ratio"]
-                params["sigma_amp_ratio"] = jnn.softplus(u_ar) + eps
+                sigma_ar = jnn.softplus(u_ar) + eps
+                params["sigma_amp_ratio"] = sigma_ar
+                params["sigma_amp_ratio_global"] = sigma_ar
 
             return params
 
@@ -872,7 +1105,28 @@ class InversionBlackJAX:
             log_p += log_unif_sigma + log_jac_sigma
 
             # Prior for sigma_amp_ratio (HalfCauchy + Jacobian of softplus)
-            if has_ar:
+            if station_smooth_ar:
+                u_ar = position["sigma_amp_ratio_global"]
+                sigma_ar = jnn.softplus(u_ar) + eps
+                beta_hc = amp_ratio_sigma_prior
+                log_p_hc = (
+                    jnp.log(2.0)
+                    - jnp.log(jnp.pi * beta_hc)
+                    - jnp.log(1.0 + (sigma_ar / beta_hc) ** 2)
+                )
+                log_p += log_p_hc + jnn.log_sigmoid(u_ar)
+
+                z_station = position["sigma_amp_ratio_station_log_offset"]
+                z_scaled = z_station / amp_ratio_station_log_scale
+                log_p += -0.5 * jnp.mean(z_scaled**2)
+                if has_smooth_edges:
+                    edge_diff = z_station[edge_i_jax] - z_station[edge_j_jax]
+                    log_p += (
+                        -0.5
+                        * amp_ratio_smooth_strength
+                        * jnp.mean(edge_w_jax * (edge_diff / amp_ratio_station_log_scale) ** 2)
+                    )
+            elif has_ar:
                 u_ar = position["sigma_amp_ratio"]
                 sigma_ar = jnn.softplus(u_ar) + eps
                 beta_hc = amp_ratio_sigma_prior
@@ -947,7 +1201,10 @@ class InversionBlackJAX:
 
                 # Log-normal likelihood
                 # Combine measurement variance with sigma_amp_ratio variance
-                sigma_ar = params["sigma_amp_ratio"]
+                if station_smooth_ar:
+                    sigma_ar = params["sigma_amp_ratio_station"][ratio_station_index_jax]
+                else:
+                    sigma_ar = params["sigma_amp_ratio"]
                 sigma_combined = jnp.sqrt(log_ratio_sigma_jax**2 + sigma_ar**2)
                 sigma_bc = sigma_combined[:, None]
 
@@ -977,7 +1234,9 @@ class InversionBlackJAX:
 
         def init_particle(key):
             n_keys = 5 if (not dc) else 3
-            if has_ar:
+            if station_smooth_ar:
+                n_keys += 2
+            elif has_ar:
                 n_keys += 1
             keys = random.split(key, n_keys)
             idx = 0
@@ -1005,7 +1264,22 @@ class InversionBlackJAX:
             params_u["h"] = _logit(h_raw)
             params_u["sigma"] = _logit(s_raw)
 
-            if has_ar:
+            if station_smooth_ar:
+                u = random.uniform(keys[idx], minval=eps, maxval=1.0 - eps)
+                idx += 1
+                sigma_ar = amp_ratio_sigma_prior * jnp.tan(jnp.pi * u / 2.0)
+                sigma_ar = jnp.clip(sigma_ar, 1e-6, 100.0)
+                params_u["sigma_amp_ratio_global"] = _softplus_inv(sigma_ar)
+                params_u["sigma_amp_ratio_station_log_offset"] = (
+                    random.normal(
+                        keys[idx],
+                        shape=(n_amp_ratio_stations,),
+                        dtype=jnp.float64,
+                    )
+                    * amp_ratio_station_log_scale
+                    * 0.1
+                )
+            elif has_ar:
                 u = random.uniform(keys[idx], minval=eps, maxval=1.0 - eps)
                 sigma_ar = amp_ratio_sigma_prior * jnp.tan(jnp.pi * u / 2.0)
                 sigma_ar = jnp.clip(sigma_ar, 1e-6, 100.0)
@@ -1101,7 +1375,11 @@ class InversionBlackJAX:
 
             if use_blockwise:
                 # --- Metropolis-Within-Gibbs (MWG) kernel ---
-                blocks = default_mwg_blocks(dc=dc, has_ar=has_ar)
+                blocks = default_mwg_blocks(
+                    dc=dc,
+                    has_ar=has_ar,
+                    noise_fields=amp_ratio_noise_fields,
+                )
                 field_names = list(initial_particles.keys())
 
                 initial_stds_by_field = {
@@ -1320,7 +1598,7 @@ class InversionBlackJAX:
             # persistent_weights:   (n_iter+1, n_particles)
             # Flatten across iterations to get all accumulated samples
             flat_particles = jax.tree.map(
-                lambda x: x.reshape(-1), smc_st.persistent_particles
+                lambda x: x.reshape((-1,) + x.shape[2:]), smc_st.persistent_particles
             )
             particles_phys = _unconstrained_to_params(flat_particles)
 
@@ -1341,8 +1619,22 @@ class InversionBlackJAX:
 
         if has_ar:
             sigma_ar_s = np.asarray(particles_phys["sigma_amp_ratio"])
+            sigma_ar_global_s = np.asarray(particles_phys["sigma_amp_ratio_global"])
+            if station_smooth_ar:
+                sigma_ar_station_s = np.asarray(
+                    particles_phys["sigma_amp_ratio_station"]
+                )
+                sigma_ar_station_names = np.asarray(
+                    ar_station_context["station_names"], dtype=object
+                )
+            else:
+                sigma_ar_station_s = None
+                sigma_ar_station_names = None
         else:
             sigma_ar_s = None
+            sigma_ar_global_s = None
+            sigma_ar_station_s = None
+            sigma_ar_station_names = None
 
         mt6_samples = Tape_MT6(gamma_s, delta_s, kappa_s, h_s, sigma_s)
         mt6_samples = np.asarray(mt6_samples, dtype=float)
@@ -1362,6 +1654,9 @@ class InversionBlackJAX:
             weights=final_weights,
             idata=None,
             sigma_amp_ratio=sigma_ar_s,
+            sigma_amp_ratio_global=sigma_ar_global_s,
+            sigma_amp_ratio_station=sigma_ar_station_s,
+            sigma_amp_ratio_station_names=sigma_ar_station_names,
         )
 
     def _extract_polarity_observations(self, data: DataDict) -> np.ndarray:

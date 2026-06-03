@@ -265,7 +265,7 @@ def read_data(
             # We'll rely on input filtered data or phase_score for now as user simplified request.
             # Geometry from P row usually
             az, to = get_geom(p_row) 
-            
+
             p_amp = p_row['phase_amplitude']
             sh_amp = sh_row['phase_amplitude']
             
@@ -298,6 +298,7 @@ def read_data(
         # P/SV
         if p_row is not None and sv_row is not None:
             az, to = get_geom(p_row)
+
             p_amp = p_row['phase_amplitude']
             sv_amp = sv_row['phase_amplitude']
             
@@ -317,6 +318,7 @@ def read_data(
         if sh_row is not None and sv_row is not None:
             # Use SH geometry?
             az, to = get_geom(sh_row)
+
             sh_amp = sh_row['phase_amplitude']
             sv_amp = sv_row['phase_amplitude']
             

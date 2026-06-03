@@ -205,14 +205,18 @@ def build_mwg_parameter_update_fn(
 # Convenience: MWG blocks with extra inner steps for mechanism
 # ---------------------------------------------------------------------------
 
-def default_mwg_blocks(dc: bool, has_ar: bool) -> Tuple[RMHBlock, ...]:
+def default_mwg_blocks(
+    dc: bool,
+    has_ar: bool,
+    noise_fields: Tuple[str, ...] | None = None,
+) -> Tuple[RMHBlock, ...]:
     """Same block layout as default_rmh_blocks."""
     blocks = []
     if not dc:
         blocks.append(RMHBlock("source_type", ("gamma", "delta")))
     blocks.append(RMHBlock("mechanism", ("kappa", "h", "sigma")))
     if has_ar:
-        blocks.append(RMHBlock("noise", ("sigma_amp_ratio",)))
+        blocks.append(RMHBlock("noise", noise_fields or ("sigma_amp_ratio",)))
     return tuple(blocks)
 
 

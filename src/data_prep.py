@@ -395,7 +395,11 @@ def amplitude_matrix(
 def amplitude_ratio_matrix(
     data: Dict[str, Any],
     location_samples: Any = False,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return_metadata: bool = False,
+) -> Union[
+    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray]],
+]:
     """
     Generate amplitude ratio observation matrices from an event data dictionary.
 
@@ -408,6 +412,9 @@ def amplitude_ratio_matrix(
         Event data dictionary.
     location_samples
         Optional list of location scatter samples (as in MTfit).
+    return_metadata
+        If True, also return observation-order metadata with station names,
+        nominal azimuth/takeoff, and ratio keys.
 
     Returns
     -------
@@ -421,6 +428,9 @@ def amplitude_ratio_matrix(
         Fractional errors on numerator amplitudes, shape (N_obs,).
     percentage_error2 : np.ndarray
         Fractional errors on denominator amplitudes, shape (N_obs,).
+    metadata : dict, optional
+        Returned only when ``return_metadata=True``. Keys are ``station_names``,
+        ``azimuth``, ``takeoff``, and ``ratio_key``.
     """
     a = False
     a1 = False
@@ -428,6 +438,12 @@ def amplitude_ratio_matrix(
     percentage_error1 = False
     percentage_error2 = False
     amplitude_ratio = False
+    metadata_parts: Dict[str, List[np.ndarray]] = {
+        "station_names": [],
+        "azimuth": [],
+        "takeoff": [],
+        "ratio_key": [],
+    }
 
     if location_samples:
         original_samples = [u.copy() for u in location_samples]
@@ -466,6 +482,9 @@ def amplitude_ratio_matrix(
             indices = [data[key]["Stations"]["Name"].index(u) for u in selected_stations]
             _measured = np.asarray(data[key]["Measured"][indices], dtype=float)
             error = np.asarray(data[key]["Error"][indices], dtype=float)
+            meta_names = np.asarray(selected_stations, dtype=object)
+            meta_az = np.asarray(data[key]["Stations"]["Azimuth"], dtype=float).reshape(-1)[indices]
+            meta_to = np.asarray(data[key]["Stations"]["TakeOffAngle"], dtype=float).reshape(-1)[indices]
         else:
             n_stations = int(np.prod(np.asarray(data[key]["Stations"]["TakeOffAngle"]).shape))
             angles1 = np.zeros((n_stations, 1, 6), dtype=float)
@@ -478,6 +497,9 @@ def amplitude_ratio_matrix(
             angles = [angles1, angles2]
             _measured = np.asarray(data[key]["Measured"], dtype=float)
             error = np.asarray(data[key]["Error"], dtype=float)
+            meta_names = np.asarray(data[key]["Stations"]["Name"], dtype=object).reshape(-1)
+            meta_az = np.asarray(data[key]["Stations"]["Azimuth"], dtype=float).reshape(-1)
+            meta_to = np.asarray(data[key]["Stations"]["TakeOffAngle"], dtype=float).reshape(-1)
 
         # Normalise measurement shapes:
         # - Standard case: _measured has two columns (numerator, denominator).
@@ -506,6 +528,18 @@ def amplitude_ratio_matrix(
         this_amp_ratio = np.abs(num_meas / den_meas).astype(float)
         this_perc_err1 = (err_num / np.abs(num_meas)).astype(float)
         this_perc_err2 = (err_den / np.abs(den_meas)).astype(float)
+        if return_metadata:
+            n_obs = this_amp_ratio.shape[0]
+            if meta_names.shape[0] != n_obs or meta_az.shape[0] != n_obs or meta_to.shape[0] != n_obs:
+                raise ValueError(
+                    f"Amplitude-ratio metadata length mismatch for {key}: "
+                    f"observations={n_obs}, names={meta_names.shape[0]}, "
+                    f"azimuth={meta_az.shape[0]}, takeoff={meta_to.shape[0]}"
+                )
+            metadata_parts["station_names"].append(meta_names)
+            metadata_parts["azimuth"].append(meta_az)
+            metadata_parts["takeoff"].append(meta_to)
+            metadata_parts["ratio_key"].append(np.full(n_obs, key, dtype=object))
 
         if not a:
             a = True
@@ -520,5 +554,14 @@ def amplitude_ratio_matrix(
             amplitude_ratio = np.append(amplitude_ratio, this_amp_ratio, axis=0)
             percentage_error1 = np.append(percentage_error1, this_perc_err1, axis=0)
             percentage_error2 = np.append(percentage_error2, this_perc_err2, axis=0)
+
+    if return_metadata:
+        metadata = {
+            name: np.concatenate(parts, axis=0) if parts else np.asarray([], dtype=object)
+            for name, parts in metadata_parts.items()
+        }
+        metadata["azimuth"] = metadata["azimuth"].astype(float, copy=False)
+        metadata["takeoff"] = metadata["takeoff"].astype(float, copy=False)
+        return a1, a2, amplitude_ratio, percentage_error1, percentage_error2, metadata
 
     return a1, a2, amplitude_ratio, percentage_error1, percentage_error2
