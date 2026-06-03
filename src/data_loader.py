@@ -5,6 +5,67 @@ from obspy.taup import TauPyModel
 from obspy.geodetics import locations2degrees, gps2dist_azimuth
 from obspy.taup.taup_create import build_taup_model
 
+# Per-band spectral amplitude columns written by 2_amplitude_polarity.py, used
+# to fold band-to-band amplitude-ratio scatter into the per-amplitude error.
+_RATIO_BAND_COLS = ["phase_amp_b1", "phase_amp_b2", "phase_amp_b3"]
+
+
+def _row_amp_frac_err(row, max_err):
+    """Fractional amplitude error for an amplitude-ratio measurement.
+
+    Prefers the measurement-based ``phase_amp_frac_err`` (multi-window scatter)
+    from 2_amplitude_polarity.py; falls back to the legacy ``1.1 - phase_score``
+    when the column is absent or invalid.
+    """
+    v = row.get("phase_amp_frac_err", np.nan)
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        v = np.nan
+    if np.isfinite(v) and v > 0:
+        return min(max_err, v)
+    return min(max_err, 1.1 - row["phase_score"])
+
+
+def _band_amps(row):
+    out = []
+    for col in _RATIO_BAND_COLS:
+        v = row.get(col, np.nan)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            v = np.nan
+        out.append(v)
+    return np.asarray(out, dtype=float)
+
+
+def _ratio_band_sigma(num_row, den_row):
+    """std of log(A_num/A_den) across frequency bands (band-to-band ratio scatter).
+
+    Returns 0.0 when fewer than two bands have valid amplitudes for both phases.
+    """
+    a_num = _band_amps(num_row)
+    a_den = _band_amps(den_row)
+    valid = np.isfinite(a_num) & np.isfinite(a_den) & (a_num > 0) & (a_den > 0)
+    if int(valid.sum()) < 2:
+        return 0.0
+    return float(np.std(np.log(a_num[valid] / a_den[valid])))
+
+
+def _combine_ratio_errors(num_row, den_row, max_err):
+    """Per-amplitude fractional errors for a ratio, with band scatter folded in.
+
+    Each amplitude's own multi-window fractional error is combined in quadrature
+    with an equal share of the band-to-band ratio scatter, so a frequency-
+    dependent ratio inflates both amplitude uncertainties.
+    """
+    num_frac = _row_amp_frac_err(num_row, max_err)
+    den_frac = _row_amp_frac_err(den_row, max_err)
+    half_band_var = (_ratio_band_sigma(num_row, den_row) ** 2) / 2.0
+    num_frac = min(max_err, float(np.sqrt(num_frac ** 2 + half_band_var)))
+    den_frac = min(max_err, float(np.sqrt(den_frac ** 2 + half_band_var)))
+    return num_frac, den_frac
+
 def get_taup_model(velocity_model_path=None):
     """
     Load or build the TauP model.
@@ -283,12 +344,11 @@ def read_data(
             # This result (e.g. 0.1) is generally treated as 10% or 0.1 fractional error.
             # So to get ABSOLUTE Error, we must multiply by Amplitude.
             
-            p_frac_err = min(MAX_RATIO_ERR, 1.1 - p_row['phase_score'])
-            sh_frac_err = min(MAX_RATIO_ERR, 1.1 - sh_row['phase_score'])
-            
+            p_frac_err, sh_frac_err = _combine_ratio_errors(p_row, sh_row, MAX_RATIO_ERR)
+
             p_abs_err = p_amp * p_frac_err
             sh_abs_err = sh_amp * sh_frac_err
-            
+
             ratio_data['P/SHAmplitudeRatio']['names'].append(station)
             ratio_data['P/SHAmplitudeRatio']['az'].append(az)
             ratio_data['P/SHAmplitudeRatio']['to'].append(to)
@@ -302,12 +362,11 @@ def read_data(
             p_amp = p_row['phase_amplitude']
             sv_amp = sv_row['phase_amplitude']
             
-            p_frac_err = min(MAX_RATIO_ERR, 1.1 - p_row['phase_score'])
-            sv_frac_err = min(MAX_RATIO_ERR, 1.1 - sv_row['phase_score'])
-            
+            p_frac_err, sv_frac_err = _combine_ratio_errors(p_row, sv_row, MAX_RATIO_ERR)
+
             p_abs_err = p_amp * p_frac_err
             sv_abs_err = sv_amp * sv_frac_err
-            
+
             ratio_data['P/SVAmplitudeRatio']['names'].append(station)
             ratio_data['P/SVAmplitudeRatio']['az'].append(az)
             ratio_data['P/SVAmplitudeRatio']['to'].append(to)
@@ -322,12 +381,11 @@ def read_data(
             sh_amp = sh_row['phase_amplitude']
             sv_amp = sv_row['phase_amplitude']
             
-            sh_frac_err = min(MAX_RATIO_ERR, 1.1 - sh_row['phase_score'])
-            sv_frac_err = min(MAX_RATIO_ERR, 1.1 - sv_row['phase_score'])
-            
+            sh_frac_err, sv_frac_err = _combine_ratio_errors(sh_row, sv_row, MAX_RATIO_ERR)
+
             sh_abs_err = sh_amp * sh_frac_err
             sv_abs_err = sv_amp * sv_frac_err
-            
+
             ratio_data['SH/SVAmplitudeRatio']['names'].append(station)
             ratio_data['SH/SVAmplitudeRatio']['az'].append(az)
             ratio_data['SH/SVAmplitudeRatio']['to'].append(to)
