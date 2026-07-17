@@ -244,14 +244,14 @@ def read_data(
     }
 
     # Error constraints
-    MAX_POL_ERROR = 0.5  # Cap error? user script used different values per phase
-    MAX_AMP_ERROR = 0.5 # Typically 0.5 or user constrained
+    MAX_POL_ERROR = 0.99  # Cap error? user script used different values per phase
+    MAX_AMP_ERROR = 0.99 # Typically 0.5 or user constrained
     
     # Default error caps from legacy script
-    MAX_P_POL_ERR = 0.5
-    MAX_SH_POL_ERR = 0.5
-    MAX_SV_POL_ERR = 0.5
-    MAX_RATIO_ERR = 0.5
+    MAX_P_POL_ERR = 0.99
+    MAX_SH_POL_ERR = 0.99
+    MAX_SV_POL_ERR = 0.99
+    MAX_RATIO_ERR = 0.99
 
     for station in stations:
         # if station.startswith("CP.C1"):continue
