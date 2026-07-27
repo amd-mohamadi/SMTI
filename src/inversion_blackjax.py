@@ -20,6 +20,7 @@ import re
 import shutil
 import sys
 import time
+import warnings
 
 import numpy as np
 
@@ -57,6 +58,48 @@ from .data_prep import (
 
 DataDict = Dict[str, Any]
 _SMALL_NUMBER = 1e-10
+
+# Above this argument value ``expm1`` is already astronomically larger than the
+# ``eps`` floor, so the two branches of :func:`softplus_inv` agree to well
+# below float64 round-off (relative difference ~1e-16 at x = 20).
+_SOFTPLUS_INV_LARGE_X = 20.0
+
+
+def softplus_inv(x, eps: float = 1e-6):
+    """Numerically stable inverse of ``softplus``, i.e. ``log(exp(x) - 1)``.
+
+    Behaviourally equivalent to the original formulation
+    ``log(expm1(max(x, eps)) + eps)`` (identical to <1e-12 relative in float64),
+    but overflow-free: ``expm1`` returns ``+inf`` for ``x >~ 89`` in float32
+    (and ``x >~ 710`` in float64), which turned ~1.5% of the initial
+    ``sigma_amp_ratio`` particles into ``+inf`` in float32 and silently froze
+    the noise block for a whole run (M0 cross-cutting finding 2).
+
+    For large ``x`` the identity ``log(expm1(x)) = x + log1p(-exp(-x))`` is used,
+    which never evaluates ``exp`` of a large positive number.  The ``eps`` floor
+    on ``x`` and the ``+ eps`` inside the log (which matters only for very small
+    ``x``) are preserved.
+
+    .. note::
+
+       "Behaviourally equivalent" is not "bit-identical": over the actual
+       initial-particle distribution ~0.2% of float64 values (those on the
+       ``x > 20`` branch) shift by 1 ulp (max |diff| ~7e-15).  MCMC
+       accept/reject amplifies last-bit differences chaotically, so a seeded
+       run started after this change does **not** reproduce a pre-change run
+       particle-for-particle -- it reproduces it statistically.  Archived
+       reference posteriors (e.g. the eq00124 numbers in
+       ``202607_q_factor_diagnosis.md``) need re-baselining after the merge.
+    """
+    xc = jnp.maximum(x, eps)
+    is_large = xc > _SOFTPLUS_INV_LARGE_X
+    # Guard both branches so neither can produce inf/nan for the *other*
+    # branch's inputs (jnp.where evaluates both sides).
+    x_small = jnp.where(is_large, jnp.asarray(1.0, xc.dtype), xc)
+    x_large = jnp.where(is_large, xc, jnp.asarray(_SOFTPLUS_INV_LARGE_X, xc.dtype))
+    small = jnp.log(jnp.expm1(x_small) + eps)
+    large = x_large + jnp.log1p(-jnp.exp(-x_large))
+    return jnp.where(is_large, large, small)
 
 
 def _blackjax_process_chain_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -152,6 +195,10 @@ class InversionResult:
     sigma_amp_ratio_station: Optional[np.ndarray] = None
     sigma_amp_ratio_station_names: Optional[np.ndarray] = None
     num_chains: int = 1
+    #: True when SMC stopped on the tempering-stall guard instead of reaching
+    #: beta = 1 (set per chain by the batched path; stacked results report
+    #: True if any chain stalled).
+    tempering_stalled: bool = False
 
 
 class InversionBlackJAX:
@@ -389,6 +436,7 @@ class InversionBlackJAX:
                 if result.sigma_amp_ratio_station_names is None
                 else np.asarray(result.sigma_amp_ratio_station_names, dtype=object)
             ),
+            "tempering_stalled": bool(result.tempering_stalled),
         }
 
     @staticmethod
@@ -423,6 +471,7 @@ class InversionBlackJAX:
                 if payload.get("sigma_amp_ratio_station_names") is None
                 else np.asarray(payload["sigma_amp_ratio_station_names"], dtype=object)
             ),
+            tempering_stalled=bool(payload.get("tempering_stalled", False)),
         )
 
     @staticmethod
@@ -667,6 +716,20 @@ class InversionBlackJAX:
         self.random_seed = original_seed
         self.rng = original_rng
 
+        return self._stack_chain_results(chain_results)
+
+    def _stack_chain_results(
+        self, chain_results: List[InversionResult]
+    ) -> InversionResult:
+        """Stack per-chain results into one chain-major :class:`InversionResult`.
+
+        Extracted verbatim from the tail of :meth:`_invert_multi_chain` so the
+        batched path (``inversion_blackjax_batched``) produces exactly the same
+        structure: ``mt6`` ``(chains, 6, n_samples)``, ``gamma`` ...
+        ``(chains, n_samples)``, ``num_chains`` set.  For persistent sampling
+        chains may have different sample counts, so shorter chains are padded
+        with zero-weight repeats first.
+        """
         if self.smc_method == "adaptive_persistent":
             # Persistent sampling: chains may have different sample counts.
             # Pad shorter chains to match the longest, using zero weights
@@ -725,6 +788,7 @@ class InversionBlackJAX:
                             else None
                         ),
                         sigma_amp_ratio_station_names=r.sigma_amp_ratio_station_names,
+                        tempering_stalled=r.tempering_stalled,
                     )
                 )
             chain_results = padded
@@ -756,6 +820,7 @@ class InversionBlackJAX:
             ),
             sigma_amp_ratio_station_names=chain_results[0].sigma_amp_ratio_station_names,
             num_chains=self.num_chains,
+            tempering_stalled=any(bool(r.tempering_stalled) for r in chain_results),
         )
 
     @staticmethod
@@ -837,24 +902,29 @@ class InversionBlackJAX:
             "edge_w": np.asarray(edge_w, dtype=float),
         }
 
-    def _invert_single_event(
+    def _prepare_event_arrays(
         self,
         event: DataDict,
         location_samples: Optional[List[Dict[str, Any]]] = None,
-        progress_callback: Optional[Any] = None,
-    ) -> InversionResult:
-        """Run SMC inversion for a single event."""
-        start_time = time.time()
+    ) -> Dict[str, Any]:
+        """Build the numpy data arrays / flags one event's likelihood needs.
 
-        def _emit_progress(message: str) -> None:
-            if progress_callback is None:
-                print(message)
-            else:
-                progress_callback(message)
+        Pure extraction of the data-preparation block that used to live inline
+        at the top of :meth:`_invert_single_event` — same computations, same
+        order, same dtypes.  Kept side-effect free (apart from consuming
+        ``self.rng`` when ``location_samples`` is None, exactly as before) so
+        the batched GPU path can reuse it per event.
 
-        _emit_progress("Preparing data and likelihood matrices...")
-
-        # --- Prepare Data ---
+        Returns a dict with keys:
+          ``has_pol``, ``has_ar``, ``station_smooth_ar`` (flags),
+          ``location_samples``,
+          ``a_pol`` (N_pol, N_loc, 6), ``error_pol`` (N_pol,), ``pol_obs``
+          (N_pol,), ``incorrect_prob`` (float or (N_pol,)),
+          ``a1_ar``/``a2_ar`` (N_ar, N_loc, 6), ``amp_ratio_obs`` (N_ar,),
+          ``log_ratio_sigma`` (N_ar,), ``ar_station_context``.
+        ``pol_obs`` is not used by the JAX likelihood (the sign is already
+        folded into ``a_pol``) but is returned for completeness/diagnostics.
+        """
         has_pol = any(
             "polarity" in key.lower() and "prob" not in key.lower()
             for key in event.keys()
@@ -943,6 +1013,76 @@ class InversionBlackJAX:
             log_ratio_sigma = None
             ar_station_context = None
 
+        return {
+            "has_pol": has_pol,
+            "has_ar": has_ar,
+            "station_smooth_ar": station_smooth_ar,
+            "location_samples": location_samples,
+            "a_pol": a_pol_np,
+            "error_pol": error_pol_np,
+            "pol_obs": pol_obs,
+            "incorrect_prob": incorrect_prob,
+            "a1_ar": a1_ar_np,
+            "a2_ar": a2_ar_np,
+            "amp_ratio_obs": amp_ratio_obs,
+            "log_ratio_sigma": log_ratio_sigma,
+            "ar_station_context": ar_station_context,
+        }
+
+    def _invert_single_event(
+        self,
+        event: DataDict,
+        location_samples: Optional[List[Dict[str, Any]]] = None,
+        progress_callback: Optional[Any] = None,
+    ) -> InversionResult:
+        """Run SMC inversion for a single event."""
+        start_time = time.time()
+
+        def _emit_progress(message: str) -> None:
+            if progress_callback is None:
+                print(message)
+            else:
+                progress_callback(message)
+
+        # ``jax_enable_x64`` is process-global: a process that disabled it to run
+        # the batched sampler in float32 (see ``inversion_blackjax_batched``'s
+        # module docstring) would silently run THIS float64 sampler in single
+        # precision, and the result is cast back to float64 by numpy so nothing
+        # downstream would reveal it.  Warn loudly rather than fail, since the
+        # unbatched path is also the documented fp32 fallback.
+        if not jax.config.jax_enable_x64:
+            warnings.warn(
+                "_invert_single_event is running with jax_enable_x64=False: the "
+                "production float64 sampler will be evaluated in float32. Run "
+                "the batched fp32 path in a separate process if float64 "
+                "fallback results are required.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _emit_progress(
+                "WARNING: jax_enable_x64 is False -- this inversion runs in float32."
+            )
+
+        _emit_progress("Preparing data and likelihood matrices...")
+
+        # --- Prepare Data ---
+        prepared = self._prepare_event_arrays(
+            event, location_samples=location_samples
+        )
+        has_pol = prepared["has_pol"]
+        has_ar = prepared["has_ar"]
+        station_smooth_ar = prepared["station_smooth_ar"]
+        location_samples = prepared["location_samples"]
+        a_pol_np = prepared["a_pol"]
+        error_pol_np = prepared["error_pol"]
+        pol_obs = prepared["pol_obs"]
+        incorrect_prob = prepared["incorrect_prob"]
+        a1_ar_np = prepared["a1_ar"]
+        a2_ar_np = prepared["a2_ar"]
+        amp_ratio_obs = prepared["amp_ratio_obs"]
+        log_ratio_sigma = prepared["log_ratio_sigma"]
+        ar_station_context = prepared["ar_station_context"]
+
         # --- Build JAX Log-Density Functions ---
 
         # Convert data to JAX arrays
@@ -998,7 +1138,8 @@ class InversionBlackJAX:
             return jnp.log(p) - jnp.log1p(-p)
 
         def _softplus_inv(x):
-            return jnp.log(jnp.expm1(jnp.maximum(x, eps)) + eps)
+            # Stable, overflow-free; see module-level ``softplus_inv``.
+            return softplus_inv(x, eps)
 
         def _unconstrained_to_params(position):
             params = {}
@@ -1507,6 +1648,7 @@ class InversionBlackJAX:
         smc_st = _get_smc_state(state)
         prev_beta = float(smc_st.tempering_param)
         stall_count = 0
+        tempering_stalled = False
         for iteration in range(self.max_smc_iterations):
             smc_st = _get_smc_state(state)
             if use_persistent:
@@ -1575,6 +1717,7 @@ class InversionBlackJAX:
             else:
                 stall_count = 0
             if stall_count >= self.tempering_stall_patience:
+                tempering_stalled = True
                 _emit_progress(
                     "SMC tempering stalled "
                     f"(delta_beta < {self.min_tempering_increment:.1e} for {stall_count} stages). "
@@ -1657,6 +1800,7 @@ class InversionBlackJAX:
             sigma_amp_ratio_global=sigma_ar_global_s,
             sigma_amp_ratio_station=sigma_ar_station_s,
             sigma_amp_ratio_station_names=sigma_ar_station_names,
+            tempering_stalled=tempering_stalled,
         )
 
     def _extract_polarity_observations(self, data: DataDict) -> np.ndarray:

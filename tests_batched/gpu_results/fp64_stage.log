@@ -1,0 +1,76 @@
+stage=fp64 x64=True devices=[CudaDevice(id=0)]
+GPU guard OK (compute apps: 1803713, 270)
+  eq00126: N_pol=15 N_ar=22
+  eq00124: N_pol=44 N_ar=62
+  eq00167: N_pol=44 N_ar=64
+  eq00047: N_pol=96 N_ar=132
+
+=== Test 1: batched vs unbatched, eq00124, 4 chains, P=2000, fp64 ===
+    ... Stage 19: beta=0.1925 (d=0.02169), ESS=1892/2000, acc=0.173
+    ... Stage 3: beta=0.0095 (d=0.00376), ESS=1918/2000, acc=0.254
+    ... Stage 28: beta=0.5255 (d=0.05734), ESS=1910/2000, acc=0.136
+    ... Stage 12: beta=0.0733 (d=0.01128), ESS=1888/2000, acc=0.231
+    ... Preparing data and likelihood matrices...
+    ... Stage 21: beta=0.2347 (d=0.02550), ESS=1897/2000, acc=0.143
+  unbatched eq00124: 27.5s, stages/chain=[34, 34, 34, 34]
+  [bucket 1/1 N_pol=48 N_ar=64 B=4] events=['eq00124'] stages=34 SMC 15.52s | steady-state 333.0 ms/stage (median), first stage 4.5s (incl. step compile), init 0.1s dtype=float64
+  [PASS] 1a. pooled gamma |batched - unbatched| < 0.02  --  batched +0.2764 vs unbatched +0.2764, |d|=0.00000
+  [PASS] 1b. pooled delta |batched - unbatched| < 0.02  --  batched -0.1789 vs unbatched -0.1789, |d|=0.00000
+  [PASS] 1c. dominant kappa-mode weight |d| < 0.05  --  batched 0.8762 vs unbatched 0.8762, |d|=0.00000
+  [PASS] 1d. kappa circmean agrees (< 0.05 rad)  --  batched 4.2858 vs unbatched 4.2858, |d|=0.00000
+  [PASS] 1e. per-chain gamma/delta agree (< 0.02 each)  --  gamma b=[0.2857 0.271  0.2748 0.2741] u=[0.2857 0.271  0.2748 0.2741]
+  [PASS] 1f. stage counts agree  --  batched 34 stages (all entries) vs unbatched per chain [34, 34, 34, 34]
+  [PASS] 1g. particle-for-particle agreement for chains with equal stage counts (< 1e-6)  --  chains [0, 1, 2, 3]: max|diff|=5.732e-14; all chains ran the same number of stages
+  [PASS] 1h. batched pooled gamma/delta inside the production band  --  gamma +0.2764 (ref 0.247 +-0.06), delta -0.1789 (ref -0.145 +-0.08)
+  [PASS] 1i. all batched outputs finite, weights normalised  --  weight sums ['1.000000', '1.000000', '1.000000', '1.000000']
+
+=== Test 3a: per-event unbatched fp64 references, P=1000 ===
+    ... Stage 19: beta=0.5607 (d=0.06520), ESS=952/1000, acc=0.164
+    ... Stage 13: beta=0.2232 (d=0.03729), ESS=953/1000, acc=0.253
+    ... Stage 6: beta=0.0572 (d=0.01289), ESS=962/1000, acc=0.252
+    ... Running BlackJAX adaptive tempered SMC (RMH)...
+    ... Stage 25: beta=1.0000 (d=0.04219), ESS=988/1000, acc=0.134
+  unbatched eq00126: 17.2s, stages/chain=[24, 25, 24, 25]
+    eq00126: gamma=-0.1100 delta=+0.0147
+    ... Stage 19: beta=0.1950 (d=0.02042), ESS=953/1000, acc=0.149
+    ... Stage 3: beta=0.0095 (d=0.00391), ESS=955/1000, acc=0.266
+    ... Stage 28: beta=0.5623 (d=0.06192), ESS=953/1000, acc=0.142
+    ... Stage 13: beta=0.0901 (d=0.01285), ESS=937/1000, acc=0.209
+    ... Initial particle log-likelihood stats: finite=1.000, min=-861.132, max=-92.464
+    ... Stage 23: beta=0.3084 (d=0.03212), ESS=957/1000, acc=0.161
+  unbatched eq00124: 80.9s, stages/chain=[34, 33, 33, 33]
+    eq00124: gamma=+0.2880 delta=-0.1285
+    ... Stage 19: beta=0.1670 (d=0.01883), ESS=963/1000, acc=0.163
+    ... Stage 4: beta=0.0095 (d=0.00323), ESS=963/1000, acc=0.242
+    ... Stage 29: beta=0.6283 (d=0.07691), ESS=951/1000, acc=0.116
+    ... Stage 14: beta=0.0814 (d=0.01200), ESS=950/1000, acc=0.253
+    ... Initial particle log-likelihood stats: finite=1.000, min=-1000.000, max=-66.344
+    ... Stage 23: beta=0.2786 (d=0.03364), ESS=960/1000, acc=0.162
+  unbatched eq00167: 81.0s, stages/chain=[33, 33, 34, 33]
+    eq00167: gamma=+0.0723 delta=-0.1653
+    ... Stage 19: beta=0.0951 (d=0.01071), ESS=945/1000, acc=0.160
+    ... Initial particle log-likelihood stats: finite=1.000, min=-1000.000, max=-211.125
+    ... Stage 23: beta=0.1448 (d=0.01492), ESS=956/1000, acc=0.118
+    ... Stage 2: beta=0.0034 (d=0.00172), ESS=939/1000, acc=0.238
+    ... Stage 27: beta=0.2242 (d=0.02590), ESS=952/1000, acc=0.141
+    ... Stage 5: beta=0.0091 (d=0.00208), ESS=958/1000, acc=0.215
+    ... Stage 30: beta=0.3249 (d=0.03576), ESS=960/1000, acc=0.126
+  unbatched eq00047: 88.6s, stages/chain=[39, 39, 40, 40]
+    eq00047: gamma=+0.1112 delta=-0.1950
+
+=== Test 3b: padding-leak tests (fp64, P=400, 1 chain) ===
+  [bucket 1/2 N_pol=48 N_ar=64 B=1] events=['eq00124'] stages=33 SMC 5.42s | steady-state 25.3 ms/stage (median), first stage 4.6s (incl. step compile), init 0.1s dtype=float64
+  [bucket 2/2 N_pol=16 N_ar=24 B=1] events=['eq00126'] stages=25 SMC 4.30s | steady-state 13.6 ms/stage (median), first stage 4.0s (incl. step compile), init 0.1s dtype=float64
+  [bucket 1/2 N_pol=48 N_ar=64 B=1] events=['eq00124'] stages=33 SMC 4.72s | steady-state 24.7 ms/stage (median), first stage 3.9s (incl. step compile), init 0.1s dtype=float64
+  [bucket 2/2 N_pol=16 N_ar=24 B=1] events=['eq00126'] stages=25 SMC 4.40s | steady-state 13.5 ms/stage (median), first stage 4.1s (incl. step compile), init 0.1s dtype=float64
+  [bucket 1/2 N_pol=64 N_ar=64 B=1] events=['eq00124'] stages=33 SMC 4.80s | steady-state 27.1 ms/stage (median), first stage 3.9s (incl. step compile), init 0.1s dtype=float64
+  [bucket 2/2 N_pol=32 N_ar=32 B=1] events=['eq00126'] stages=25 SMC 4.47s | steady-state 20.3 ms/stage (median), first stage 4.0s (incl. step compile), init 0.1s dtype=float64
+  [PASS] 3b-1. garbage in padded rows does not change fp64 results (< 1e-12)  --  eq00124: gamma 0.0e+00, delta 0.0e+00, kappa 0.0e+00, h 0.0e+00, sigma 0.0e+00, sigma_amp_ratio 0.0e+00, weights 0.0e+00, mt6 0.0e+00; eq00126: gamma 0.0e+00, delta 0.0e+00, kappa 0.0e+00, h 0.0e+00, sigma 0.0e+00, sigma_amp_ratio 0.0e+00, weights 0.0e+00, mt6 0.0e+00
+  [PASS] 3b-2. re-padding to a multiple of 32 does not change fp64 results (< 1e-12)  --  eq00124: gamma 0.0e+00, delta 0.0e+00, kappa 0.0e+00, h 0.0e+00, sigma 0.0e+00, sigma_amp_ratio 0.0e+00, weights 0.0e+00, mt6 0.0e+00; eq00126: gamma 1.5e-15, delta 2.9e-15, kappa 9.8e-15, h 1.7e-15, sigma 5.8e-15, sigma_amp_ratio 2.2e-14, weights 4.3e-18, mt6 9.5e-15
+  loglik vs pad width (fp64): eq00124: rel 0.00e+00, bit-identical 20/20; eq00126: rel 3.99e-16, bit-identical 12/20
+wrote /net/geol-seismic.artsci.tamu.edu/s0/data/CAPE/smti_workflow/SMTI_dev/tests_batched/gpu_results/fp64.json
+
+==============================================================================
+11/11 checks passed  (fp64 stage)
+==============================================================================
+

@@ -1,0 +1,37 @@
+stage=fp32 x64=False devices=[CudaDevice(id=0)]
+GPU guard OK (compute apps: 1796315, 270)
+  [PASS] 0. jax_enable_x64 is False in the fp32 process  --  x64=False
+
+=== Test 2: fp32 batched, eq00124, 4 chains, P=2000 ===
+  [bucket 1/1 N_pol=48 N_ar=64 B=4] events=['eq00124'] stages=34 SMC 21.65s | steady-state 28.8 ms/stage (median), first stage 20.7s (incl. step compile), init 0.2s dtype=float32
+  [PASS] 2a. fp32 particles are float32  --  float32
+  [PASS] 2b. fp32 outputs finite, all entries reached lambda=1  --  lambda=[1.0, 1.0, 1.0, 1.0]
+
+=== Test 3c: 4 heterogeneous events x 4 chains, fp32, P=2000 ===
+  [bucket 1/3 N_pol=16 N_ar=24 B=4] events=['eq00126'] stages=25 SMC 20.96s | steady-state 16.3 ms/stage (median), first stage 20.6s (incl. step compile), init 0.1s dtype=float32
+  [bucket 2/3 N_pol=48 N_ar=64 B=8] events=['eq00124', 'eq00167'] stages=34 SMC 21.82s | steady-state 54.7 ms/stage (median), first stage 20.0s (incl. step compile), init 0.1s dtype=float32
+  [bucket 3/3 N_pol=96 N_ar=136 B=4] events=['eq00047'] stages=40 SMC 22.88s | steady-state 57.5 ms/stage (median), first stage 20.6s (incl. step compile), init 0.1s dtype=float32
+  [PASS] 3c-1. every event present, all outputs finite  --  events=['eq00047', 'eq00124', 'eq00126', 'eq00167']
+  [PASS] 3c-2. all entries reached lambda=1, none stalled  --  [bucket 1/3 N_pol=16 N_ar=24 B=4] lambda min=1.0000; [bucket 2/3 N_pol=48 N_ar=64 B=8] lambda min=1.0000; [bucket 3/3 N_pol=96 N_ar=136 B=4] lambda min=1.0000
+
+=== Test 3d: padding-leak tests (fp32, same 4-event batch) ===
+  [bucket 1/3 N_pol=16 N_ar=24 B=4] events=['eq00126'] stages=25 SMC 20.53s | steady-state 16.2 ms/stage (median), first stage 20.1s (incl. step compile), init 0.1s dtype=float32
+  [bucket 2/3 N_pol=48 N_ar=64 B=8] events=['eq00124', 'eq00167'] stages=34 SMC 21.66s | steady-state 54.8 ms/stage (median), first stage 19.8s (incl. step compile), init 0.1s dtype=float32
+  [bucket 3/3 N_pol=96 N_ar=136 B=4] events=['eq00047'] stages=40 SMC 22.18s | steady-state 57.5 ms/stage (median), first stage 19.9s (incl. step compile), init 0.1s dtype=float32
+  [bucket 1/3 N_pol=32 N_ar=32 B=4] events=['eq00126'] stages=25 SMC 20.33s | steady-state 17.1 ms/stage (median), first stage 19.9s (incl. step compile), init 0.1s dtype=float32
+  [bucket 2/3 N_pol=64 N_ar=64 B=8] events=['eq00124', 'eq00167'] stages=34 SMC 21.59s | steady-state 57.6 ms/stage (median), first stage 19.7s (incl. step compile), init 0.1s dtype=float32
+  [bucket 3/3 N_pol=96 N_ar=160 B=4] events=['eq00047'] stages=40 SMC 22.32s | steady-state 65.3 ms/stage (median), first stage 19.8s (incl. step compile), init 0.1s dtype=float32
+  [PASS] 3d-1. garbage in padded rows does not change fp32 results (< 1e-6)  --  eq00126: max 0.00e+00; eq00124: max 0.00e+00; eq00167: max 0.00e+00; eq00047: max 0.00e+00
+  [PASS] 3d-2. wider padding perturbs the fp32 log-likelihood only at fp32 round-off (rel < 1e-5)  --  eq00126: rel 2.02e-07, bit-identical 12/20; eq00124: rel 1.07e-07, bit-identical 17/20; eq00167: rel 6.33e-08, bit-identical 19/20; eq00047: rel 0.00e+00, bit-identical 20/20
+  [PASS] 3d-3. wider padding leaves the fp32 posterior unchanged within MC noise (gamma/delta < 0.03)  --  eq00126: dgamma -0.0057 ddelta +0.0071 (elementwise max 5.5e+00); eq00124: dgamma +0.0026 ddelta +0.0023 (elementwise max 3.8e+00); eq00167: dgamma +0.0029 ddelta +0.0052 (elementwise max 4.9e+00); eq00047: dgamma +0.0000 ddelta +0.0000 (elementwise max 0.0e+00)
+
+=== Test 4: perf snapshot, 4 same-shape events x 4 chains (B=16), fp32, P=2000 ===
+  [bucket 1/1 N_pol=48 N_ar=64 B=16] events=['eq00124', 'eq00141', 'eq00167', 'eq00188'] stages=35 SMC 24.51s | steady-state 107.3 ms/stage (median), first stage 20.9s (incl. step compile), init 0.1s dtype=float32
+  [PASS] 4a. perf snapshot is a single B=16 bucket  --  buckets=1, B=16, n_pol=48, n_ar=64
+    107.3 ms/stage vs M0 spike4 fp32 B=16: 107.5 ms/stage (full-run 3.68 s / 34 stages = 108.2)
+wrote /net/geol-seismic.artsci.tamu.edu/s0/data/CAPE/smti_workflow/SMTI_dev/tests_batched/gpu_results/fp32.json
+
+==============================================================================
+9/9 checks passed  (fp32 stage)
+==============================================================================
+

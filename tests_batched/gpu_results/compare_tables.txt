@@ -1,0 +1,101 @@
+stage=compare x64=True devices=[CpuDevice(id=0)]
+
+==============================================================================
+TABLE 1 -- batched vs unbatched (fp64, eq00124, 4 chains, P=2000)
+==============================================================================
+  quantity                    batched  unbatched       diff
+  gamma (pooled)              +0.2764    +0.2764    +0.0000  PASS
+  delta (pooled)              -0.1789    -0.1789    +0.0000  PASS
+  kappa circmean              +4.2858    +4.2858    -0.0000
+  dominant mode weight        +0.8762    +0.8762    +0.0000  PASS
+  h                           +0.2288    +0.2288    +0.0000
+  sigma                       +0.5376    +0.5376    +0.0000
+  sigma_amp_ratio             +0.1331    +0.1331    +0.0000
+    chain 0 gamma             +0.2857    +0.2857    +0.0000  PASS
+    chain 0 delta             -0.1801    -0.1801    +0.0000  PASS
+    chain 1 gamma             +0.2710    +0.2710    -0.0000  PASS
+    chain 1 delta             -0.1910    -0.1910    +0.0000  PASS
+    chain 2 gamma             +0.2748    +0.2748    +0.0000  PASS
+    chain 2 delta             -0.1686    -0.1686    +0.0000  PASS
+    chain 3 gamma             +0.2741    +0.2741    +0.0000  PASS
+    chain 3 delta             -0.1757    -0.1757    -0.0000  PASS
+  stages: batched 34  unbatched per chain [34, 34, 34, 34]
+  wall:   batched 17.1s (SMC 15.5s + init/compile 0.1s)  unbatched 27.5s
+  element-wise max|diff| (all chains): gamma 5.66e-15, delta 1.24e-14, kappa 3.73e-14, h 3.89e-15, sigma 1.87e-14, sigma_amp_ratio 3.61e-14, weights 1.54e-16, mt6 5.73e-14
+    chain 0 (+0 lambda=1 stage(s) in the batch): gamma 4.66e-15, delta 7.33e-15, kappa 3.46e-14, h 3.89e-15, sigma 1.87e-14, sigma_amp_ratio 1.47e-14, weights 2.66e-17, mt6 5.73e-14
+    chain 1 (+0 lambda=1 stage(s) in the batch): gamma 3.44e-15, delta 6.44e-15, kappa 2.49e-14, h 3.16e-15, sigma 7.99e-15, sigma_amp_ratio 1.49e-14, weights 4.10e-17, mt6 3.84e-14
+    chain 2 (+0 lambda=1 stage(s) in the batch): gamma 5.66e-15, delta 1.24e-14, kappa 2.66e-14, h 3.50e-15, sigma 1.33e-14, sigma_amp_ratio 1.41e-14, weights 9.54e-17, mt6 3.95e-14
+    chain 3 (+0 lambda=1 stage(s) in the batch): gamma 3.66e-15, delta 3.77e-15, kappa 3.73e-14, h 3.72e-15, sigma 1.20e-14, sigma_amp_ratio 3.61e-14, weights 1.54e-16, mt6 5.15e-14
+
+==============================================================================
+TABLE 2 -- fp32 vs fp64 batched (eq00124, 4 chains)
+==============================================================================
+  quantity                       fp32       fp64       diff
+  gamma                       +0.2690    +0.2764    -0.0074  PASS
+  delta                       -0.1778    -0.1789    +0.0011  PASS
+  dominant mode weight        +0.8890    +0.8762    +0.0128  PASS
+  kappa circmean              +4.2852    +4.2858    -0.0007
+  h                           +0.2304    +0.2288    +0.0016
+  sigma                       +0.5429    +0.5376    +0.0054
+  sigma_amp_ratio             +0.1329    +0.1331    -0.0002
+  stages: fp32 34  fp64 34  (diff +0, tol +-2)
+  steady-state per stage (B=4): fp32 28.8 ms  fp64 333.0 ms  speedup 11.6x
+  SMC wall (incl. step compile): fp32 21.65s  fp64 15.52s
+  [PASS] 2c. fp32 vs fp64 gamma |d| < 0.03  --  |d|=0.0074
+  [PASS] 2d. fp32 vs fp64 delta |d| < 0.03  --  |d|=0.0011
+  [PASS] 2e. fp32 vs fp64 dominant weight |d| < 0.06  --  |d|=0.0128
+  [PASS] 2f. fp32 stage count within +-2 of fp64  --  fp32 34 vs fp64 34
+
+==============================================================================
+TABLE 3 -- multi-event: fp32 batched vs fp64 unbatched per event
+==============================================================================
+  event      N_pol  N_ar       bucket      g32      g64       dg      d32      d64       dd
+  eq00126       15    22      (16,24)  -0.1115  -0.1100  -0.0016  -0.0045  +0.0147  -0.0191
+  eq00124       44    62      (48,64)  +0.2950  +0.2880  +0.0071  -0.1325  -0.1285  -0.0041
+  eq00167       44    64      (48,64)  +0.0673  +0.0723  -0.0050  -0.1499  -0.1653  +0.0154
+  eq00047       96   132     (96,136)  +0.1159  +0.1112  +0.0047  -0.2005  -0.1950  -0.0055
+  [PASS] 3e. per-event gamma/delta agree within combined MC tolerance (0.05)  --  see TABLE 3
+
+==============================================================================
+TABLE 4 -- perf snapshot (fp32, B=16, P=2000)
+==============================================================================
+  bucket 48x64 B=16: 35 stages, SMC 24.51s total; steady state 107.3 ms/stage (median), 106.6 ms min; first stage 20.9s (= XLA compile), init 0.1s
+  M0 spike4 fp32 B=16 P=2000: 107.47 ms/stage (pure step), full-run 3.68 s / 34 stages = 108.2 ms/stage
+  productionised: 107.3 ms/stage -> 1.00x of the spike (within 25%)
+  (whole-run incl. compile: 700.3 ms/stage; compile 20.9s)
+  GPU memory: {'bytes_in_use': 0.0, 'peak_bytes_in_use': 657.6} nvidia-smi used 2343 MiB
+  multi-event fp32 run:
+    bucket 16x24 B=4 events=['eq00126']: 25 stages, 20.96s (steady state 16.3 ms/stage, first stage 20.6s)
+    bucket 48x64 B=8 events=['eq00124', 'eq00167']: 34 stages, 21.82s (steady state 54.7 ms/stage, first stage 20.0s)
+    bucket 96x136 B=4 events=['eq00047']: 40 stages, 22.88s (steady state 57.5 ms/stage, first stage 20.6s)
+    total wall for the 4-event batch: 70.9s
+
+==============================================================================
+TABLE 5 -- padding / mask leak tests
+==============================================================================
+  garbage in every masked-out row (element-wise max|diff| vs the normal run):
+    fp64 (P=400, 1 chain)        eq00124: 0.00e+00
+    fp64 (P=400, 1 chain)        eq00126: 0.00e+00
+    fp32 (4 events x 4 chains)   eq00126: 0.00e+00
+    fp32 (4 events x 4 chains)   eq00124: 0.00e+00
+    fp32 (4 events x 4 chains)   eq00167: 0.00e+00
+    fp32 (4 events x 4 chains)   eq00047: 0.00e+00
+  re-padded to a multiple of 32 (element-wise max|diff|):
+    fp64                         eq00124: 0.00e+00
+    fp64                         eq00126: 2.23e-14
+    fp32                         eq00126: 5.53e+00
+    fp32                         eq00124: 3.81e+00
+    fp32                         eq00167: 4.86e+00
+    fp32                         eq00047: 0.00e+00
+  log-likelihood at 20 fixed positions, pad 8 vs pad 32 (relative):
+    fp64                         eq00124: rel 0.00e+00, bit-identical 20/20, shapes {'8': [48, 64], '32': [64, 64]}
+    fp64                         eq00126: rel 3.99e-16, bit-identical 12/20, shapes {'8': [16, 24], '32': [32, 32]}
+    fp32                         eq00126: rel 2.02e-07, bit-identical 12/20, shapes {'8': [16, 24], '32': [32, 32]}
+    fp32                         eq00124: rel 1.07e-07, bit-identical 17/20, shapes {'8': [48, 64], '32': [64, 64]}
+    fp32                         eq00167: rel 6.33e-08, bit-identical 19/20, shapes {'8': [48, 64], '32': [64, 64]}
+    fp32                         eq00047: rel 0.00e+00, bit-identical 20/20, shapes {'8': [96, 136], '32': [96, 160]}
+
+==============================================================================
+25/25 checks passed  (compare stage)
+==============================================================================
+

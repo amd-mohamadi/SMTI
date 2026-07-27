@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import jax.numpy as jnp
 from jax import random
@@ -82,7 +83,11 @@ def build_blockwise_scale_overrides(
         _require_known_fields(block, current_stds, "current_stds")
 
         d = len(block.fields)
-        optimal_factor = 2.38 / jnp.sqrt(jnp.asarray(d, dtype=jnp.float64))
+        # ``d`` is a static Python int, so evaluate the factor in Python and
+        # leave it weakly typed: the result then adopts the dtype of the
+        # std arrays it multiplies instead of forcing float64 (which warns and
+        # silently downcasts when jax_enable_x64 is off).
+        optimal_factor = 2.38 / math.sqrt(float(d))
 
         initial_mean = jnp.mean(
             jnp.asarray([initial_stds[field] for field in block.fields])
