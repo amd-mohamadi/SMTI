@@ -10,6 +10,7 @@ This module provides helpers to:
 - Check for multimodality in parameter space (e.g. kappa, h, sigma) using HDBSCAN.
 - Quantify angular uncertainty around a reference MT (e.g. MAP or median).
 - Compute a scalar MT quality score from an InferenceData object.
+- Compute block-wise Qdc (orientation / Kagan) and Qndc (source type / lune) scores.
 - Generate MTfit-style synthetic events using the current forward model.
 """
 
@@ -19,16 +20,20 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import arviz as az
 import numpy as np
+import warnings
 from scipy.signal import find_peaks
 from scipy.stats import gaussian_kde
 from sklearn.cluster import HDBSCAN
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.mixture import GaussianMixture
 
-from sklearn.mixture import GaussianMixture
 import os
 
 from .moment_tesnor_conversion import MT33_MT6
 from .forward_model import forward_amplitude
+
+
+ESS_HEALTHY_BIC = 1000.0
 
 
 def find_map_mt6_kde(mt6_samples: np.ndarray) -> Tuple[np.ndarray, int]:
@@ -616,6 +621,980 @@ def angular_uncertainty(
     }
 
 
+# ---------------------------------------------------------------------------
+# Qdc / Qndc primitives (see smti_inversion/202607_q_factor_diagnosis.md)
+# ---------------------------------------------------------------------------
+
+# Four-fold DC principal-axis symmetries used by the Kagan angle (right-multiply
+# on the orientation matrix U = [T N P]).
+_DC_AXIS_SYMMETRIES = (
+    np.diag([1.0, 1.0, 1.0]),
+    np.diag([1.0, -1.0, -1.0]),
+    np.diag([-1.0, 1.0, -1.0]),
+    np.diag([-1.0, -1.0, 1.0]),
+)
+
+
+def _as_1d(x: np.ndarray) -> np.ndarray:
+    """Flatten parameter arrays that may be (n,), (chain, draw), etc."""
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim == 0:
+        return arr.reshape(1)
+    return arr.reshape(-1)
+
+
+def lune_unit_vectors(gamma: np.ndarray, delta: np.ndarray) -> np.ndarray:
+    """
+    Map Tape (gamma, delta) to unit vectors on the eigenvalue lune sphere.
+
+    Uses the same spherical coordinates as ``tape.GD_E``:
+    ``phi = pi/2 - delta``, ``X = (cos g sin phi, sin g sin phi, cos phi)``.
+
+    Parameters
+    ----------
+    gamma, delta : array-like
+        Tape source-type parameters in radians (any broadcastable shape).
+
+    Returns
+    -------
+    X : np.ndarray
+        Unit vectors with shape ``(*broadcast_shape, 3)``.
+    """
+    g = np.asarray(gamma, dtype=float)
+    d = np.asarray(delta, dtype=float)
+    g, d = np.broadcast_arrays(g, d)
+    phi = 0.5 * np.pi - d
+    sin_phi = np.sin(phi)
+    x0 = np.cos(g) * sin_phi
+    x1 = np.sin(g) * sin_phi
+    x2 = np.cos(phi)
+    return np.stack([x0, x1, x2], axis=-1)
+
+
+def lune_distance_deg(
+    gamma_ref: float,
+    delta_ref: float,
+    gamma: np.ndarray,
+    delta: np.ndarray,
+) -> np.ndarray:
+    """
+    Great-circle angular distance (degrees) on the Tape lune from a reference.
+
+    Parameters
+    ----------
+    gamma_ref, delta_ref : float
+        Reference source-type parameters (radians).
+    gamma, delta : array-like
+        Sample source-type parameters (radians).
+
+    Returns
+    -------
+    angles_deg : np.ndarray
+        Distance from the reference for each sample, in degrees.
+    """
+    x_ref = lune_unit_vectors(gamma_ref, delta_ref).reshape(3)
+    x = lune_unit_vectors(gamma, delta)
+    # Flatten trailing sample dims for the dot product, then reshape.
+    flat = x.reshape(-1, 3)
+    cosang = np.clip(flat @ x_ref, -1.0, 1.0)
+    angles = np.degrees(np.arccos(cosang))
+    return angles.reshape(np.broadcast_shapes(np.shape(gamma), np.shape(delta)))
+
+
+def orientation_matrices(
+    kappa: np.ndarray,
+    h: np.ndarray,
+    sigma: np.ndarray,
+) -> np.ndarray:
+    """
+    Build orientation matrices ``U = [T N P]`` from Tape orientation params.
+
+    Parameters
+    ----------
+    kappa, h, sigma : array-like
+        Strike (rad), cos(dip), rake (rad). Broadcast together.
+
+    Returns
+    -------
+    U : np.ndarray
+        Shape ``(n, 3, 3)`` with columns T, N, P for each sample.
+    """
+    k = _as_1d(kappa)
+    hh = np.clip(_as_1d(h), 0.0, 1.0)
+    s = _as_1d(sigma)
+    n = k.size
+    if hh.size != n or s.size != n:
+        k, hh, s = np.broadcast_arrays(k, hh, s)
+        n = k.size
+
+    # Vectorised SDR_TNP (same formulas as tape.SDR_TNP).
+    dip = np.arccos(hh)
+    cos_k = np.cos(k)
+    sin_k = np.sin(k)
+    cos_d = np.cos(dip)
+    sin_d = np.sin(dip)
+    cos_r = np.cos(s)
+    sin_r = np.sin(s)
+
+    # Fault normal N2 and slip N1 (Tape N-E-D convention).
+    n1 = np.stack(
+        [
+            cos_k * cos_r + sin_k * cos_d * sin_r,
+            sin_k * cos_r - cos_k * cos_d * sin_r,
+            -sin_d * sin_r,
+        ],
+        axis=1,
+    )
+    n2 = np.stack(
+        [
+            -sin_k * sin_d,
+            cos_k * sin_d,
+            -cos_d,
+        ],
+        axis=1,
+    )
+
+    t = n1 + n2
+    t_norm = np.linalg.norm(t, axis=1, keepdims=True)
+    t = t / np.maximum(t_norm, 1e-15)
+    p = n1 - n2
+    p_norm = np.linalg.norm(p, axis=1, keepdims=True)
+    p = p / np.maximum(p_norm, 1e-15)
+    n_axis = -np.cross(t, p)
+    n_norm = np.linalg.norm(n_axis, axis=1, keepdims=True)
+    n_axis = n_axis / np.maximum(n_norm, 1e-15)
+
+    # U columns: T, N, P  -> shape (n, 3, 3)
+    return np.stack([t, n_axis, p], axis=2)
+
+
+def kagan_angles_deg(
+    kappa_ref: float,
+    h_ref: float,
+    sigma_ref: float,
+    kappa: np.ndarray,
+    h: np.ndarray,
+    sigma: np.ndarray,
+) -> np.ndarray:
+    """
+    Kagan angles (degrees) between a reference orientation and many samples.
+
+    The Kagan angle is the minimum rotation angle between two double-couple
+    orientations, minimised over the four-fold principal-axis symmetry group.
+
+    Parameters
+    ----------
+    kappa_ref, h_ref, sigma_ref : float
+        Reference Tape orientation (radians / cos(dip) / radians).
+    kappa, h, sigma : array-like
+        Sample orientations, same units.
+
+    Returns
+    -------
+    angles_deg : np.ndarray, shape (n_samples,)
+    """
+    u_ref = orientation_matrices(
+        np.asarray(kappa_ref, dtype=float).reshape(1),
+        np.asarray(h_ref, dtype=float).reshape(1),
+        np.asarray(sigma_ref, dtype=float).reshape(1),
+    )[0]  # (3, 3)
+    u = orientation_matrices(kappa, h, sigma)  # (n, 3, 3)
+    n = u.shape[0]
+    min_ang = np.full(n, 180.0, dtype=float)
+    u_ref_t = u_ref.T  # (3, 3)
+    for S in _DC_AXIS_SYMMETRIES:
+        # R_i = U_ref.T @ (U_i @ S)
+        us = u @ S  # (n, 3, 3)
+        r = np.einsum("ab,nbc->nac", u_ref_t, us)
+        tr = r[:, 0, 0] + r[:, 1, 1] + r[:, 2, 2]
+        cosang = np.clip(0.5 * (tr - 1.0), -1.0, 1.0)
+        ang = np.degrees(np.arccos(cosang))
+        min_ang = np.minimum(min_ang, ang)
+    return min_ang
+
+
+def kagan_angle_deg(
+    kappa1: float,
+    h1: float,
+    sigma1: float,
+    kappa2: float,
+    h2: float,
+    sigma2: float,
+) -> float:
+    """Scalar Kagan angle (degrees) between two Tape orientations."""
+    return float(
+        kagan_angles_deg(kappa1, h1, sigma1, kappa2, h2, sigma2)[0]
+    )
+
+
+def _circular_mean(angles_rad: np.ndarray) -> float:
+    """Circular mean of angles in radians."""
+    a = np.asarray(angles_rad, dtype=float).reshape(-1)
+    if a.size == 0:
+        return float("nan")
+    return float(np.arctan2(np.mean(np.sin(a)), np.mean(np.cos(a))))
+
+
+def _angle_quantile_score(
+    q_deg: float,
+    angle_good: float,
+    angle_bad: float,
+) -> float:
+    """Map an angular quantile to [0, 1] (good -> 1, bad or worse -> 0)."""
+    span = max(float(angle_bad) - float(angle_good), 1e-9)
+    return float(np.clip((float(angle_bad) - float(q_deg)) / span, 0.0, 1.0))
+
+
+def _precision_from_quantiles(
+    q50: float,
+    q90: float,
+    angle_good: float,
+    angle_bad: float,
+) -> float:
+    return 0.5 * _angle_quantile_score(q50, angle_good, angle_bad) + 0.5 * _angle_quantile_score(
+        q90, angle_good, angle_bad
+    )
+
+
+def _chain_shape(
+    values: np.ndarray,
+    n_chains: Optional[int],
+) -> Optional[Tuple[int, int]]:
+    if values.ndim == 2:
+        return int(values.shape[0]), int(values.shape[1])
+    if n_chains is not None and int(n_chains) > 1:
+        n_total = _as_1d(values).size
+        if n_total % int(n_chains) == 0:
+            return int(n_chains), n_total // int(n_chains)
+    return None
+
+
+def _diag_gmm_bic(
+    features: np.ndarray,
+    k_max: int,
+    seed: int,
+) -> Tuple[np.ndarray, Dict[int, float]]:
+    n_samples = int(features.shape[0])
+    k_hi = min(max(int(k_max), 1), n_samples)
+    fits: Dict[int, Tuple[float, GaussianMixture]] = {}
+    for n_components in range(1, k_hi + 1):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ConvergenceWarning)
+                model = GaussianMixture(
+                    n_components=n_components,
+                    covariance_type="diag",
+                    reg_covar=1e-4,
+                    n_init=3,
+                    random_state=int(seed),
+                ).fit(features)
+        except Exception:
+            continue
+        fits[n_components] = (float(model.bic(features)), model)
+    if not fits:
+        raise RuntimeError("all GaussianMixture fits failed")
+    best_k = min(fits, key=lambda n_components: fits[n_components][0])
+    responsibilities = fits[best_k][1].predict_proba(features)
+    return np.asarray(responsibilities, dtype=float), {
+        n_components: fit[0] for n_components, fit in fits.items()
+    }
+
+
+def _per_chain_mode_std(
+    responsibilities: np.ndarray,
+    components: Sequence[int],
+    survivor_components: Sequence[int],
+    chain_shape: Optional[Tuple[int, int]],
+) -> float:
+    if chain_shape is None or chain_shape[0] <= 1:
+        return 0.0
+    if responsibilities.shape[0] != chain_shape[0] * chain_shape[1]:
+        return 0.0
+    numerator = responsibilities[:, list(components)].sum(axis=1).reshape(chain_shape).mean(axis=1)
+    denominator = (
+        responsibilities[:, list(survivor_components)]
+        .sum(axis=1)
+        .reshape(chain_shape)
+        .mean(axis=1)
+    )
+    per_chain = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator),
+        where=denominator > 0.0,
+    )
+    return float(np.std(per_chain, ddof=0))
+
+
+def cluster_orientation_params(
+    kappa: np.ndarray,
+    h: np.ndarray,
+    sigma: np.ndarray,
+    n_chains: Optional[int] = None,
+    mode_min_weight: float = 0.10,
+    mode_min_kagan_deg: float = 15.0,
+    k_max: int = 6,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """
+    Select orientation components by GMM+BIC and merge physical DC modes.
+
+    Components closer than ``mode_min_kagan_deg`` are merged iteratively.
+    Components below ``mode_min_weight`` are removed from the soft-weight
+    normalization, while their hard-assigned samples are reassigned to the
+    nearest surviving mode for strike/dip/rake summaries.
+    """
+    k_arr = np.asarray(kappa, dtype=float)
+    h_arr = np.asarray(h, dtype=float)
+    s_arr = np.asarray(sigma, dtype=float)
+    chain_shape = _chain_shape(k_arr, n_chains)
+    k = _as_1d(k_arr)
+    hh = _as_1d(h_arr)
+    ss = _as_1d(s_arr)
+    n = k.size
+    nan = float("nan")
+    if hh.size != n or ss.size != n:
+        raise ValueError("kappa, h, and sigma must contain the same number of samples")
+    if n == 0:
+        return {
+            "n_modes_dc": 0,
+            "s_mode_dc": nan,
+            "dc_top_mode_weight": nan,
+            "dc_mode_weight_std": nan,
+            "dc_mode1_weight": nan,
+            "labels": np.zeros(0, dtype=int),
+            "dc_mode0_strike_deg": nan,
+            "dc_mode0_dip_deg": nan,
+            "dc_mode0_rake_deg": nan,
+            "dc_mode1_strike_deg": nan,
+            "dc_mode1_dip_deg": nan,
+            "dc_mode1_rake_deg": nan,
+            "dc_mode_list": [],
+            "dc_bic_by_k": {},
+            "dc_q50_within_mode_deg": nan,
+            "dc_q90_within_mode_deg": nan,
+        }
+
+    if n == 1:
+        responsibilities = np.ones((1, 1), dtype=float)
+        bic_by_k = {1: nan}
+    else:
+        features = np.column_stack([np.cos(k), np.sin(k), 2.0 * hh, ss])
+        try:
+            responsibilities, bic_by_k = _diag_gmm_bic(features, k_max=k_max, seed=seed)
+        except Exception as exc:
+            from scipy.cluster.vq import kmeans2
+
+            warnings.warn(
+                f"GMM+BIC orientation clustering failed ({exc}); using kmeans2 fallback",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            n_components = min(2, n)
+            _, raw_labels = kmeans2(
+                features,
+                n_components,
+                seed=int(seed),
+                minit="++",
+                iter=50,
+            )
+            responsibilities = np.eye(n_components, dtype=float)[np.asarray(raw_labels, dtype=int)]
+            bic_by_k = {}
+
+    raw_labels = responsibilities.argmax(axis=1)
+    raw_weights = responsibilities.mean(axis=0)
+    clusters = [
+        {
+            "components": [component],
+            "members": np.flatnonzero(raw_labels == component),
+            "weight": float(raw_weights[component]),
+        }
+        for component in range(responsibilities.shape[1])
+        if np.any(raw_labels == component)
+    ]
+
+    def representative(cluster: Dict[str, Any]) -> Tuple[float, float, float]:
+        members = cluster["members"]
+        return (
+            _circular_mean(k[members]),
+            float(np.median(hh[members])),
+            float(np.median(ss[members])),
+        )
+
+    while len(clusters) > 1:
+        pairs = [
+            (
+                kagan_angle_deg(*representative(clusters[first]), *representative(clusters[second])),
+                first,
+                second,
+            )
+            for first in range(len(clusters))
+            for second in range(first + 1, len(clusters))
+        ]
+        separation, first, second = min(pairs)
+        if separation >= float(mode_min_kagan_deg):
+            break
+        clusters[first] = {
+            "components": clusters[first]["components"] + clusters[second]["components"],
+            "members": np.concatenate(
+                [clusters[first]["members"], clusters[second]["members"]]
+            ),
+            "weight": clusters[first]["weight"] + clusters[second]["weight"],
+        }
+        del clusters[second]
+
+    survivors = [
+        cluster for cluster in clusters if cluster["weight"] >= float(mode_min_weight)
+    ]
+    if not survivors:
+        survivors = [max(clusters, key=lambda cluster: cluster["weight"])]
+    survivor_ids = {id(cluster) for cluster in survivors}
+    dropped = [cluster for cluster in clusters if id(cluster) not in survivor_ids]
+    for cluster in survivors:
+        cluster["precision_members"] = cluster["members"].copy()
+
+    survivor_representatives = [representative(cluster) for cluster in survivors]
+    for cluster in dropped:
+        members = cluster["members"]
+        distances = np.column_stack(
+            [
+                kagan_angles_deg(*mode_ref, k[members], hh[members], ss[members])
+                for mode_ref in survivor_representatives
+            ]
+        )
+        nearest = np.argmin(distances, axis=1)
+        for survivor_index, survivor in enumerate(survivors):
+            assigned = members[nearest == survivor_index]
+            survivor["members"] = np.concatenate([survivor["members"], assigned])
+
+    weight_sum = float(sum(cluster["weight"] for cluster in survivors))
+    for cluster in survivors:
+        cluster["normalized_weight"] = cluster["weight"] / weight_sum
+    survivors.sort(key=lambda cluster: cluster["normalized_weight"], reverse=True)
+    survivor_components = [
+        component for cluster in survivors for component in cluster["components"]
+    ]
+
+    labels = np.full(n, -1, dtype=int)
+    mode_list = []
+    for mode_index, cluster in enumerate(survivors):
+        members = cluster["members"]
+        precision_members = cluster["precision_members"]
+        labels[members] = mode_index
+        strike = float(np.degrees(_circular_mean(k[members])) % 360.0)
+        dip = float(
+            np.degrees(np.arccos(np.clip(np.mean(hh[members]), 0.0, 1.0)))
+        )
+        rake = float(np.degrees(np.mean(ss[members])))
+        mode_ref = representative(
+            {"members": precision_members}
+        )
+        angles = kagan_angles_deg(
+            *mode_ref,
+            k[precision_members],
+            hh[precision_members],
+            ss[precision_members],
+        )
+        mode_list.append(
+            {
+                "strike": strike,
+                "dip": dip,
+                "rake": rake,
+                "weight": float(cluster["normalized_weight"]),
+                "per_chain_weight_std": _per_chain_mode_std(
+                    responsibilities,
+                    cluster["components"],
+                    survivor_components,
+                    chain_shape,
+                ),
+                "q50_within_mode_deg": float(np.percentile(angles, 50.0)),
+                "q90_within_mode_deg": float(np.percentile(angles, 90.0)),
+            }
+        )
+
+    mode0 = mode_list[0]
+    mode1 = mode_list[1] if len(mode_list) > 1 else None
+    return {
+        "n_modes_dc": len(mode_list),
+        "s_mode_dc": mode0["weight"],
+        "dc_top_mode_weight": mode0["weight"],
+        "dc_mode_weight_std": mode0["per_chain_weight_std"],
+        "dc_mode1_weight": mode1["weight"] if mode1 is not None else nan,
+        "labels": labels,
+        "dc_mode0_strike_deg": mode0["strike"],
+        "dc_mode0_dip_deg": mode0["dip"],
+        "dc_mode0_rake_deg": mode0["rake"],
+        "dc_mode1_strike_deg": mode1["strike"] if mode1 is not None else nan,
+        "dc_mode1_dip_deg": mode1["dip"] if mode1 is not None else nan,
+        "dc_mode1_rake_deg": mode1["rake"] if mode1 is not None else nan,
+        "dc_mode_list": mode_list,
+        "dc_bic_by_k": bic_by_k,
+        "dc_q50_within_mode_deg": mode0["q50_within_mode_deg"],
+        "dc_q90_within_mode_deg": mode0["q90_within_mode_deg"],
+    }
+
+
+def cluster_lune_params(
+    gamma: np.ndarray,
+    delta: np.ndarray,
+    n_chains: Optional[int] = None,
+    mode_min_weight: float = 0.10,
+    mode_min_lune_deg: float = 15.0,
+    k_max: int = 6,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """
+    Select source-type components by GMM+BIC and merge them on the lune.
+
+    Soft weights are renormalized after sub-threshold components are dropped.
+    Dropped hard-assigned samples are retained in the nearest surviving mode's
+    gamma/delta summary without transferring their probability mass.
+    """
+    g_arr = np.asarray(gamma, dtype=float)
+    d_arr = np.asarray(delta, dtype=float)
+    chain_shape = _chain_shape(g_arr, n_chains)
+    g = _as_1d(g_arr)
+    d = _as_1d(d_arr)
+    n = g.size
+    nan = float("nan")
+    if d.size != n:
+        raise ValueError("gamma and delta must contain the same number of samples")
+    if n == 0:
+        return {
+            "n_modes_ndc": 0,
+            "s_mode_ndc": nan,
+            "ndc_top_mode_weight": nan,
+            "ndc_mode_weight_std": nan,
+            "labels": np.zeros(0, dtype=int),
+            "ndc_mode_list": [],
+            "ndc_bic_by_k": {},
+            "ndc_q50_within_mode_deg": nan,
+            "ndc_q90_within_mode_deg": nan,
+        }
+
+    if n == 1:
+        responsibilities = np.ones((1, 1), dtype=float)
+        bic_by_k = {1: nan}
+    else:
+        responsibilities, bic_by_k = _diag_gmm_bic(
+            np.column_stack([g, d]),
+            k_max=k_max,
+            seed=seed,
+        )
+    raw_labels = responsibilities.argmax(axis=1)
+    raw_weights = responsibilities.mean(axis=0)
+    clusters = [
+        {
+            "components": [component],
+            "members": np.flatnonzero(raw_labels == component),
+            "weight": float(raw_weights[component]),
+        }
+        for component in range(responsibilities.shape[1])
+        if np.any(raw_labels == component)
+    ]
+
+    def representative(cluster: Dict[str, Any]) -> Tuple[float, float]:
+        members = cluster["members"]
+        return float(np.median(g[members])), float(np.median(d[members]))
+
+    while len(clusters) > 1:
+        pairs = [
+            (
+                float(
+                    lune_distance_deg(
+                        *representative(clusters[first]),
+                        *representative(clusters[second]),
+                    )
+                ),
+                first,
+                second,
+            )
+            for first in range(len(clusters))
+            for second in range(first + 1, len(clusters))
+        ]
+        separation, first, second = min(pairs)
+        if separation >= float(mode_min_lune_deg):
+            break
+        clusters[first] = {
+            "components": clusters[first]["components"] + clusters[second]["components"],
+            "members": np.concatenate(
+                [clusters[first]["members"], clusters[second]["members"]]
+            ),
+            "weight": clusters[first]["weight"] + clusters[second]["weight"],
+        }
+        del clusters[second]
+
+    survivors = [
+        cluster for cluster in clusters if cluster["weight"] >= float(mode_min_weight)
+    ]
+    if not survivors:
+        survivors = [max(clusters, key=lambda cluster: cluster["weight"])]
+    survivor_ids = {id(cluster) for cluster in survivors}
+    dropped = [cluster for cluster in clusters if id(cluster) not in survivor_ids]
+    for cluster in survivors:
+        cluster["precision_members"] = cluster["members"].copy()
+
+    survivor_representatives = [representative(cluster) for cluster in survivors]
+    for cluster in dropped:
+        members = cluster["members"]
+        distances = np.column_stack(
+            [
+                lune_distance_deg(mode_ref[0], mode_ref[1], g[members], d[members])
+                for mode_ref in survivor_representatives
+            ]
+        )
+        nearest = np.argmin(distances, axis=1)
+        for survivor_index, survivor in enumerate(survivors):
+            assigned = members[nearest == survivor_index]
+            survivor["members"] = np.concatenate([survivor["members"], assigned])
+
+    weight_sum = float(sum(cluster["weight"] for cluster in survivors))
+    for cluster in survivors:
+        cluster["normalized_weight"] = cluster["weight"] / weight_sum
+    survivors.sort(key=lambda cluster: cluster["normalized_weight"], reverse=True)
+    survivor_components = [
+        component for cluster in survivors for component in cluster["components"]
+    ]
+
+    labels = np.full(n, -1, dtype=int)
+    mode_list = []
+    for mode_index, cluster in enumerate(survivors):
+        members = cluster["members"]
+        precision_members = cluster["precision_members"]
+        labels[members] = mode_index
+        mode_ref = representative({"members": precision_members})
+        distances = lune_distance_deg(
+            mode_ref[0],
+            mode_ref[1],
+            g[precision_members],
+            d[precision_members],
+        )
+        mean_gamma = float(np.mean(g[members]))
+        mean_delta = float(np.mean(d[members]))
+        mode_list.append(
+            {
+                "gamma": mean_gamma,
+                "delta": mean_delta,
+                "gamma_deg": float(np.degrees(mean_gamma)),
+                "delta_deg": float(np.degrees(mean_delta)),
+                "weight": float(cluster["normalized_weight"]),
+                "per_chain_weight_std": _per_chain_mode_std(
+                    responsibilities,
+                    cluster["components"],
+                    survivor_components,
+                    chain_shape,
+                ),
+                "q50_within_mode_deg": float(np.percentile(distances, 50.0)),
+                "q90_within_mode_deg": float(np.percentile(distances, 90.0)),
+            }
+        )
+
+    mode0 = mode_list[0]
+    return {
+        "n_modes_ndc": len(mode_list),
+        "s_mode_ndc": mode0["weight"],
+        "ndc_top_mode_weight": mode0["weight"],
+        "ndc_mode_weight_std": mode0["per_chain_weight_std"],
+        "labels": labels,
+        "ndc_mode_list": mode_list,
+        "ndc_bic_by_k": bic_by_k,
+        "ndc_q50_within_mode_deg": mode0["q50_within_mode_deg"],
+        "ndc_q90_within_mode_deg": mode0["q90_within_mode_deg"],
+    }
+
+
+def _block_ess_rhat(
+    idata: Optional["az.InferenceData"],
+    var_names: Sequence[str],
+    ess_target: float,
+    missing_conv: float = 0.5,
+    apply_rhat_gate: bool = True,
+) -> Tuple[float, float, float]:
+    """
+    Return ``(s_conv, ess_min, r_hat_max)`` for a parameter block.
+
+    If ``idata`` is missing or ESS cannot be computed, ``s_conv`` falls back
+    to ``missing_conv`` (neutral 0.5 by default).
+    """
+    if idata is None:
+        return float(missing_conv), float("nan"), float("nan")
+
+    try:
+        summary = az.summary(idata, var_names=list(var_names), kind="all")
+    except Exception:
+        return float(missing_conv), float("nan"), float("nan")
+
+    if summary is None or summary.empty:
+        return float(missing_conv), float("nan"), float("nan")
+
+    present = [v for v in var_names if v in summary.index]
+    if not present:
+        return float(missing_conv), float("nan"), float("nan")
+
+    ess_vals = summary.loc[present, "ess_bulk"].to_numpy(dtype=float)
+    rhat_vals = summary.loc[present, "r_hat"].to_numpy(dtype=float)
+    finite_ess = ess_vals[np.isfinite(ess_vals)]
+    finite_rhat = rhat_vals[np.isfinite(rhat_vals)]
+
+    if finite_ess.size == 0:
+        return float(missing_conv), float("nan"), float("nan")
+
+    ess_min = float(np.min(finite_ess))
+    s_ess = float(np.clip(ess_min / float(ess_target), 0.0, 1.0))
+    r_hat_max = float(np.max(finite_rhat)) if finite_rhat.size else float("nan")
+
+    s_conv = s_ess
+    if apply_rhat_gate and np.isfinite(r_hat_max) and r_hat_max > 1.05:
+        # Soft gate: full credit at r_hat<=1.05, zero by 1.10.
+        s_conv *= float(np.clip((1.10 - r_hat_max) / 0.05, 0.0, 1.0))
+
+    return s_conv, ess_min, r_hat_max
+
+
+def mt_quality_scores_dc_ndc(
+    gamma: np.ndarray,
+    delta: np.ndarray,
+    kappa: np.ndarray,
+    h: np.ndarray,
+    sigma: np.ndarray,
+    ref_idx: Optional[int] = None,
+    gamma_ref: Optional[float] = None,
+    delta_ref: Optional[float] = None,
+    kappa_ref: Optional[float] = None,
+    h_ref: Optional[float] = None,
+    sigma_ref: Optional[float] = None,
+    idata: Optional["az.InferenceData"] = None,
+    n_chains: Optional[int] = None,
+    dc: bool = False,
+    ess_target: float = 400.0,
+    kagan_good: float = 10.0,
+    kagan_bad: float = 45.0,
+    lune_good: float = 5.0,
+    lune_bad: float = 25.0,
+    mode_min_weight: float = 0.10,
+    mode_min_kagan_deg: float = 15.0,
+    mode_min_lune_deg: float = 15.0,
+    k_max: int = 6,
+    ess_healthy_bic: float = ESS_HEALTHY_BIC,
+    cluster_seed: int = 0,
+) -> Dict[str, Any]:
+    """
+    Compute separate orientation (Qdc) and source-type (Qndc) quality scores.
+
+    The scores measure confidence in the dominant physical mode::
+
+        Qdc  = s_mode_dc  * (s_prec_dc  + s_conv_dc)  / 2
+        Qndc = s_mode_ndc * (s_prec_ndc + s_conv_ndc) / 2
+
+    Precision is measured within the dominant merged mode. GMM components are
+    merged with Kagan distance for DC orientation and lune distance for source
+    type. Convergence uses blockwise bulk ESS and R-hat.
+
+    Parameters
+    ----------
+    gamma, delta, kappa, h, sigma : array-like
+        Posterior Tape parameters. Shapes may be ``(n,)`` or ``(n_chains, n_draws)``.
+    ref_idx, gamma_ref, ... sigma_ref : optional
+        Retained for API compatibility. Mode-conditioned precision uses each
+        dominant mode's pooled median rather than an external reference.
+    idata : arviz.InferenceData, optional
+        Used for ESS / R-hat convergence sub-scores.
+    n_chains : int, optional
+        Chain count for per-chain mode-weight std (inferred from 2-D inputs).
+    dc : bool
+        If True, non-DC scores are set to NaN (gamma/delta fixed).
+    ess_target : float
+        Bulk ESS target for the convergence ramp (default 400).
+    kagan_good, kagan_bad : float
+        Kagan quantile anchors for ``s_prec_dc`` (degrees).
+        Defaults ``(10, 45)`` match the legacy ramp
+        ``clip((45 - q) / 35)`` used for 6-D MT angles.
+    lune_good, lune_bad : float
+        Lune quantile anchors for ``s_prec_ndc`` (degrees).
+    mode_min_weight : float
+        Soft-weight threshold for reporting a GMM component as a mode.
+    mode_min_kagan_deg, mode_min_lune_deg : float
+        Physical-mode merge thresholds in degrees.
+    k_max : int
+        Maximum GMM component count considered by BIC.
+    ess_healthy_bic : float
+        Warn when a fitted block has bulk ESS below this threshold.
+    cluster_seed : int
+        GMM random seed.
+
+    Returns
+    -------
+    result : dict
+        Flat dict of Qdc/Qndc, sub-scores, quantiles, ESS, and mode summary
+        columns suitable for merging into ``mt_results.csv``.
+    """
+    g = np.asarray(gamma, dtype=float)
+    d = np.asarray(delta, dtype=float)
+    k = np.asarray(kappa, dtype=float)
+    hh = np.asarray(h, dtype=float)
+    s = np.asarray(sigma, dtype=float)
+
+    if n_chains is None and k.ndim == 2:
+        n_chains = int(k.shape[0])
+
+    g1 = _as_1d(g)
+    d1 = _as_1d(d)
+    k1 = _as_1d(k)
+    h1 = _as_1d(hh)
+    s1 = _as_1d(s)
+    n = k1.size
+    if any(values.size != n for values in (g1, d1, h1, s1)):
+        raise ValueError(
+            "gamma, delta, kappa, h, and sigma must contain the same number of samples"
+        )
+
+    nan = float("nan")
+    out: Dict[str, Any] = {
+        "Qdc": nan,
+        "Qndc": nan,
+        "s_prec_dc": nan,
+        "s_mode_dc": nan,
+        "s_conv_dc": nan,
+        "s_prec_ndc": nan,
+        "s_mode_ndc": nan,
+        "s_conv_ndc": nan,
+        "q50_kagan_deg": nan,
+        "q90_kagan_deg": nan,
+        "q50_lune_deg": nan,
+        "q90_lune_deg": nan,
+        "ess_min_dc": nan,
+        "ess_min_ndc": nan,
+        "rhat_max_dc": nan,
+        "rhat_max_ndc": nan,
+        "n_modes_dc": nan,
+        "dc_top_mode_weight": nan,
+        "dc_mode_weight_std": nan,
+        "dc_mode1_weight": nan,
+        "dc_mode0_strike_deg": nan,
+        "dc_mode0_dip_deg": nan,
+        "dc_mode0_rake_deg": nan,
+        "dc_mode1_strike_deg": nan,
+        "dc_mode1_dip_deg": nan,
+        "dc_mode1_rake_deg": nan,
+        "n_modes_ndc": nan,
+        "ndc_top_mode_weight": nan,
+        "ndc_mode_weight_std": nan,
+        "dc_mode_list": [],
+        "ndc_mode_list": [],
+        "dc_bic_by_k": {},
+        "ndc_bic_by_k": {},
+    }
+
+    if n == 0:
+        return out
+
+    cluster = cluster_orientation_params(
+        k if k.ndim == 2 else k1,
+        hh if hh.ndim == 2 else h1,
+        s if s.ndim == 2 else s1,
+        n_chains=n_chains,
+        mode_min_weight=mode_min_weight,
+        mode_min_kagan_deg=mode_min_kagan_deg,
+        k_max=k_max,
+        seed=cluster_seed,
+    )
+    q50_k = float(cluster["dc_q50_within_mode_deg"])
+    q90_k = float(cluster["dc_q90_within_mode_deg"])
+    s_prec_dc = _precision_from_quantiles(q50_k, q90_k, kagan_good, kagan_bad)
+    s_mode_dc = float(cluster["s_mode_dc"])
+    dc_mode_list = [dict(mode) for mode in cluster["dc_mode_list"]]
+    for mode_index, mode in enumerate(dc_mode_list):
+        mask = cluster["labels"] == mode_index
+        mode["mean_gamma"] = float(np.mean(g1[mask]))
+        mode["mean_delta"] = float(np.mean(d1[mask]))
+
+    s_conv_dc, ess_min_dc, rhat_max_dc = _block_ess_rhat(
+        idata, ("kappa", "h", "sigma"), ess_target=ess_target
+    )
+    if np.isfinite(ess_min_dc) and ess_min_dc < float(ess_healthy_bic):
+        warnings.warn(
+            f"orientation-block ess_min={ess_min_dc:.0f} < {ess_healthy_bic:.0f}: "
+            f"BIC k-selection ran on correlated particles; "
+            f"n_modes_dc={cluster['n_modes_dc']} may be inflated",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    qdc = s_mode_dc * (s_prec_dc + s_conv_dc) / 2.0
+
+    out.update(
+        {
+            "Qdc": float(qdc),
+            "s_prec_dc": float(s_prec_dc),
+            "s_mode_dc": float(s_mode_dc),
+            "s_conv_dc": float(s_conv_dc),
+            "q50_kagan_deg": q50_k,
+            "q90_kagan_deg": q90_k,
+            "ess_min_dc": float(ess_min_dc),
+            "rhat_max_dc": float(rhat_max_dc),
+            "n_modes_dc": float(cluster["n_modes_dc"]),
+            "dc_top_mode_weight": float(cluster["dc_top_mode_weight"]),
+            "dc_mode_weight_std": float(cluster["dc_mode_weight_std"]),
+            "dc_mode1_weight": float(cluster["dc_mode1_weight"]),
+            "dc_mode0_strike_deg": float(cluster["dc_mode0_strike_deg"]),
+            "dc_mode0_dip_deg": float(cluster["dc_mode0_dip_deg"]),
+            "dc_mode0_rake_deg": float(cluster["dc_mode0_rake_deg"]),
+            "dc_mode1_strike_deg": float(cluster["dc_mode1_strike_deg"]),
+            "dc_mode1_dip_deg": float(cluster["dc_mode1_dip_deg"]),
+            "dc_mode1_rake_deg": float(cluster["dc_mode1_rake_deg"]),
+            "dc_mode_list": dc_mode_list,
+            "dc_bic_by_k": dict(cluster["dc_bic_by_k"]),
+        }
+    )
+
+    if dc:
+        return out
+
+    lune_cluster = cluster_lune_params(
+        g if g.ndim == 2 else g1,
+        d if d.ndim == 2 else d1,
+        n_chains=n_chains,
+        mode_min_weight=mode_min_weight,
+        mode_min_lune_deg=mode_min_lune_deg,
+        k_max=k_max,
+        seed=cluster_seed,
+    )
+    q50_l = float(lune_cluster["ndc_q50_within_mode_deg"])
+    q90_l = float(lune_cluster["ndc_q90_within_mode_deg"])
+    s_prec_ndc = _precision_from_quantiles(q50_l, q90_l, lune_good, lune_bad)
+    s_mode_ndc = float(lune_cluster["s_mode_ndc"])
+    s_conv_ndc, ess_min_ndc, rhat_max_ndc = _block_ess_rhat(
+        idata, ("gamma", "delta"), ess_target=ess_target
+    )
+    if np.isfinite(ess_min_ndc) and ess_min_ndc < float(ess_healthy_bic):
+        warnings.warn(
+            f"source-type block ess_min={ess_min_ndc:.0f} < {ess_healthy_bic:.0f}: "
+            f"BIC k-selection ran on correlated particles; "
+            f"n_modes_ndc={lune_cluster['n_modes_ndc']} may be inflated",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    qndc = s_mode_ndc * (s_prec_ndc + s_conv_ndc) / 2.0
+
+    out.update(
+        {
+            "Qndc": float(qndc),
+            "s_prec_ndc": float(s_prec_ndc),
+            "s_mode_ndc": float(s_mode_ndc),
+            "s_conv_ndc": float(s_conv_ndc),
+            "q50_lune_deg": q50_l,
+            "q90_lune_deg": q90_l,
+            "ess_min_ndc": float(ess_min_ndc),
+            "rhat_max_ndc": float(rhat_max_ndc),
+            "n_modes_ndc": float(lune_cluster["n_modes_ndc"]),
+            "ndc_top_mode_weight": float(lune_cluster["ndc_top_mode_weight"]),
+            "ndc_mode_weight_std": float(lune_cluster["ndc_mode_weight_std"]),
+            "ndc_mode_list": [dict(mode) for mode in lune_cluster["ndc_mode_list"]],
+            "ndc_bic_by_k": dict(lune_cluster["ndc_bic_by_k"]),
+        }
+    )
+    return out
+
+
 def mt_quality_score(
     mt6_samples: np.ndarray,
     mt6_mode: np.ndarray,
@@ -631,7 +1610,7 @@ def mt_quality_score(
 
     The score combines three components:
 
-    - ``s_conv`` : sampler convergence from worst-case ``\hat{R}`` and bulk ESS.
+    - ``s_conv`` : sampler convergence from worst-case R-hat and bulk ESS.
     - ``s_angle`` : angular concentration of MT6 samples around the mode
       (more heavily weighted).
     - ``s_modes`` : degree of unimodality in angular space.

@@ -15,6 +15,7 @@ Plotting classes for moment tensor plotting.
 
 import re
 import logging
+import warnings
 from distutils.version import StrictVersion
 
 import numpy as np
@@ -1313,15 +1314,23 @@ class _BasePlot(object):
 
         # Matplotlib >= 3.3 expects C to be the same shape as X/Y
         # when using shading='auto'. This avoids off-by-one grid issues.
-        return self.ax.pcolormesh(
-            x_use,
-            y_use,
-            c_use,
-            cmap=self.colormap,
-            shading='auto',
-            zorder=zorder,
-            **kwargs,
-        )
+        # Equal-area / stereonet grids are not monotone in image order; the
+        # mesh is still valid for display, so suppress the pcolormesh warning.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"The input coordinates to pcolormesh are interpreted as cell centers.*",
+                category=UserWarning,
+            )
+            return self.ax.pcolormesh(
+                x_use,
+                y_use,
+                c_use,
+                cmap=self.colormap,
+                shading='auto',
+                zorder=zorder,
+                **kwargs,
+            )
 
     def _2d_scatter_plot(self, x, y, c, marker='.', markersize=10, zorder=0, **kwargs):
         """2d scatter plot (see _scatter_plot documentation)"""

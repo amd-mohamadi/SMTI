@@ -18,10 +18,11 @@ Public API
 
 Scope (v1, matching what production actually uses)
 --------------------------------------------------
-``smc_method='adaptive_tempered'``, ``mcmc_kernel='rmh'`` with
-``adapt_proposal=True`` (MWG blockwise kernel via ``inner_kernel_tuning``),
-``amp_ratio_noise_mode='global'``, ``dc=False``.  Anything else raises
-:class:`NotImplementedError`; callers should fall back to the unbatched path.
+``smc_method='adaptive_tempered'``, ``mcmc_kernel`` in
+``{'rmh', 'irmh', 'mwg_irmh'}`` with ``adapt_proposal=True`` (MWG and/or
+GMM-IRMH via ``inner_kernel_tuning``), ``amp_ratio_noise_mode='global'``,
+``dc=False``.  NUTS and other configs raise :class:`NotImplementedError`;
+callers should fall back to the unbatched path.
 
 Precision
 ---------
@@ -81,6 +82,14 @@ from .mwg_kernel import (
     build_mwg_parameter_update_fn,
     default_inner_steps,
     default_mwg_blocks,
+)
+from .irmh_kernel import (
+    build_gmm_parameter_update_fn,
+    build_hybrid_mwg_irmh_step_fn,
+    build_irmh_step_fn,
+    gmm_params_to_mcmc_dict,
+    initial_gmm_parameter_value,
+    DiagGMM,
 )
 from .data_prep import build_location_samples_from_errors
 from .tape import Tape_MT6
@@ -175,6 +184,9 @@ class Bucket:
 # ---------------------------------------------------------------------------
 # scope guard
 # ---------------------------------------------------------------------------
+_BATCHED_MCMC_KERNELS = frozenset({"rmh", "irmh", "mwg_irmh"})
+
+
 def _check_supported(inv: Any) -> None:
     """Raise NotImplementedError for configurations the batched path lacks."""
     if inv.smc_method != "adaptive_tempered":
@@ -182,15 +194,17 @@ def _check_supported(inv: Any) -> None:
             "Batched SMC supports smc_method='adaptive_tempered' only; got "
             f"'{inv.smc_method}'. Use the unbatched path for persistent sampling."
         )
-    if inv.mcmc_kernel != "rmh":
+    kernel = str(getattr(inv, "mcmc_kernel", "rmh")).lower()
+    if kernel not in _BATCHED_MCMC_KERNELS:
         raise NotImplementedError(
-            "Batched SMC supports mcmc_kernel='rmh' only; got "
-            f"'{inv.mcmc_kernel}'. NUTS window adaptation is not vmapped."
+            "Batched SMC supports mcmc_kernel in "
+            f"{sorted(_BATCHED_MCMC_KERNELS)}; got '{inv.mcmc_kernel}'. "
+            "NUTS window adaptation is not vmapped."
         )
     if not inv.adapt_proposal:
         raise NotImplementedError(
-            "Batched SMC supports adapt_proposal=True (the blockwise MWG "
-            "kernel) only; got adapt_proposal=False."
+            "Batched SMC supports adapt_proposal=True (MWG / hybrid IRMH "
+            "parameter adaptation) only; got adapt_proposal=False."
         )
     if inv.amp_ratio_noise_mode != "global":
         raise NotImplementedError(
@@ -203,6 +217,24 @@ def _check_supported(inv: Any) -> None:
             "Batched SMC supports dc=False only; the double-couple constraint "
             "is not wired into the batched model."
         )
+
+
+def _dummy_gmm_parameter_value(
+    n_components: int, dim: int, dtype=jnp.float32
+) -> Dict[str, jnp.ndarray]:
+    """Placeholders with correct shapes for the step-path program build.
+
+    Live GMM parameters after stage 0 come from ``parameter_override`` updated
+    by ``build_gmm_parameter_update_fn``; these dummies are only structural.
+    """
+    k = int(n_components)
+    d = int(dim)
+    log_w = jnp.full((k,), -jnp.log(jnp.asarray(k, dtype=dtype)), dtype=dtype)
+    means = jnp.zeros((k, d), dtype=dtype)
+    log_stds = jnp.zeros((k, d), dtype=dtype)
+    return gmm_params_to_mcmc_dict(
+        DiagGMM(log_weights=log_w, means=means, log_stds=log_stds)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -651,12 +683,24 @@ def _build_smc(
     mechanism_steps: int,
     num_mcmc_steps: int,
     target_ess: float,
+    mcmc_kernel: str = "rmh",
+    irmh_n_components: int = 3,
+    irmh_steps: int = 1,
+    irmh_em_iters: int = 8,
+    particles: Optional[Dict[str, Any]] = None,
+    gmm_rng_key: Optional[jax.Array] = None,
 ):
     """Production SMC algorithm for one batch entry (traced under ``vmap``).
 
-    Mirrors ``_invert_single_event`` for ``mcmc_kernel='rmh'`` +
-    ``adapt_proposal=True``.  ``stds`` holds per-entry *traced* scalars instead
-    of the Python floats the unbatched path uses (M0 cross-cutting finding 5).
+    Mirrors ``_invert_single_event`` for ``mcmc_kernel`` in
+    ``{'rmh', 'irmh', 'mwg_irmh'}`` with ``adapt_proposal=True``.  ``stds``
+    holds per-entry *traced* scalars instead of the Python floats the
+    unbatched path uses (M0 cross-cutting finding 5).
+
+    ``particles`` (optional) is used only to fit the stage-0 GMM for IRMH
+    kernels.  The step-path program passes ``particles=None`` and uses dummy
+    GMM leaves; live GMM params come from ``parameter_override`` after each
+    stage.
     """
     logprior_fn, loglikelihood_fn = _make_model(
         data,
@@ -667,29 +711,92 @@ def _build_smc(
         amp_ratio_sigma_prior=amp_ratio_sigma_prior,
     )
 
+    field_names = list(stds.keys())
     blocks = default_mwg_blocks(
         dc=False, has_ar=has_ar, noise_fields=("sigma_amp_ratio",)
     )
     inner_steps = default_inner_steps(mechanism_steps=mechanism_steps)
-
-    mwg_step_fn = build_mwg_kernel(blocks=blocks, inner_steps_per_block=inner_steps)
-    mcmc_parameter_update_fn = build_mwg_parameter_update_fn(
-        blocks=blocks,
-        field_names=list(stds.keys()),
-        initial_stds=stds,
-    )
     initial_scales = build_blockwise_scale_overrides(
         blocks=blocks, initial_stds=stds, current_stds=stds
     )
-    initial_parameter_value = {
+    scale_params = {
         name: jnp.asarray(scale)[None] for name, scale in initial_scales.items()
     }
+    kernel = str(mcmc_kernel).lower()
+
+    if kernel == "rmh":
+        mcmc_step_fn = build_mwg_kernel(
+            blocks=blocks, inner_steps_per_block=inner_steps
+        )
+        mcmc_parameter_update_fn = build_mwg_parameter_update_fn(
+            blocks=blocks,
+            field_names=field_names,
+            initial_stds=stds,
+        )
+        initial_parameter_value = dict(scale_params)
+    elif kernel in {"irmh", "mwg_irmh"}:
+        dim = len(field_names)
+        if particles is not None:
+            key = gmm_rng_key if gmm_rng_key is not None else random.PRNGKey(0)
+            gmm_params = initial_gmm_parameter_value(
+                particles,
+                field_names,
+                n_components=int(irmh_n_components),
+                n_iters=int(irmh_em_iters),
+                rng_key=key,
+            )
+        else:
+            # Structural dummies for the step-path XLA program.
+            sample_dtype = jnp.result_type(
+                *[jnp.asarray(v) for v in stds.values()]
+            )
+            gmm_params = _dummy_gmm_parameter_value(
+                int(irmh_n_components), dim, dtype=sample_dtype
+            )
+
+        mwg_scale_update = build_mwg_parameter_update_fn(
+            blocks=blocks,
+            field_names=field_names,
+            initial_stds=stds,
+        )
+        if kernel == "mwg_irmh":
+            mcmc_step_fn = build_hybrid_mwg_irmh_step_fn(
+                field_names=field_names,
+                blocks=blocks,
+                inner_steps_per_block=inner_steps,
+                n_components=int(irmh_n_components),
+                n_irmh_steps=int(irmh_steps),
+            )
+            mcmc_parameter_update_fn = build_gmm_parameter_update_fn(
+                field_names=field_names,
+                n_components=int(irmh_n_components),
+                n_iters=int(irmh_em_iters),
+                mwg_update_fn=mwg_scale_update,
+            )
+            initial_parameter_value = {**scale_params, **gmm_params}
+        else:
+            mcmc_step_fn = build_irmh_step_fn(
+                field_names=field_names,
+                n_components=int(irmh_n_components),
+                n_irmh_steps=int(irmh_steps),
+            )
+            mcmc_parameter_update_fn = build_gmm_parameter_update_fn(
+                field_names=field_names,
+                n_components=int(irmh_n_components),
+                n_iters=int(irmh_em_iters),
+                mwg_update_fn=None,
+            )
+            initial_parameter_value = dict(gmm_params)
+    else:
+        raise NotImplementedError(
+            f"Batched _build_smc does not support mcmc_kernel={mcmc_kernel!r}"
+        )
 
     return inner_kernel_tuning.as_top_level_api(
         smc_algorithm=blackjax.adaptive_tempered_smc,
         logprior_fn=logprior_fn,
         loglikelihood_fn=loglikelihood_fn,
-        mcmc_step_fn=mwg_step_fn,
+        mcmc_step_fn=mcmc_step_fn,
         mcmc_init_fn=blackjax.rmh.init,
         resampling_fn=systematic,
         mcmc_parameter_update_fn=mcmc_parameter_update_fn,
@@ -764,11 +871,17 @@ def _batched_programs(smc_kwargs: Dict[str, Any]):
     if cached is not None:
         return cached
 
-    def init_fn(data, stds_e, parts):
-        return _build_smc(data, stds_e, **smc_kwargs).init(parts)
+    # Split static kwargs: IRMH init fits a GMM on ``parts``; the step path
+    # rebuilds with particles=None (dummy GMM leaves only).
+    def init_fn(data, stds_e, parts, gmm_key):
+        return _build_smc(
+            data, stds_e, particles=parts, gmm_rng_key=gmm_key, **smc_kwargs
+        ).init(parts)
 
     def step_fn(data, stds_e, key_, state):
-        return _build_smc(data, stds_e, **smc_kwargs).step(key_, state)
+        return _build_smc(data, stds_e, particles=None, **smc_kwargs).step(
+            key_, state
+        )
 
     @jax.jit
     def read_back(state, info):
@@ -784,7 +897,7 @@ def _batched_programs(smc_kwargs: Dict[str, Any]):
         return lam, ess, acc
 
     programs = (
-        jax.jit(jax.vmap(init_fn, in_axes=(0, 0, 0))),
+        jax.jit(jax.vmap(init_fn, in_axes=(0, 0, 0, 0))),
         jax.jit(jax.vmap(step_fn, in_axes=(0, 0, 0, 0))),
         read_back,
     )
@@ -864,11 +977,21 @@ def _run_bucket(
         mechanism_steps=int(inv.mechanism_steps),
         num_mcmc_steps=int(inv.num_mcmc_steps),
         target_ess=float(inv.smc_target_ess_ratio),
+        mcmc_kernel=str(getattr(inv, "mcmc_kernel", "rmh")).lower(),
+        irmh_n_components=int(getattr(inv, "irmh_n_components", 3)),
+        irmh_steps=int(getattr(inv, "irmh_steps", 1)),
+        irmh_em_iters=int(getattr(inv, "irmh_em_iters", 8)),
     )
     batched_init, batched_step, read_back = _batched_programs(smc_kwargs)
 
+    # Stage-0 GMM EM-init key, derived per entry exactly like the unbatched
+    # worker (``PRNGKey(self.random_seed ^ 0xA11CE)`` with the chain seed).
+    gmm_keys = jnp.stack(
+        [random.PRNGKey(int(e.seed) ^ 0xA11CE) for e in bucket.entries]
+    )
+
     t0 = time.time()
-    state = batched_init(data_b, stds, particles)
+    state = batched_init(data_b, stds, particles, gmm_keys)
     lam = np.asarray(_sampler_state(state).tempering_param, dtype=np.float64)
     t_init = time.time() - t0
     progress(f"{label} init+compile {t_init:.1f}s (B={B}, P={P})")
@@ -952,9 +1075,28 @@ def _run_bucket(
     params_np = {k: np.asarray(v, dtype=np.float64) for k, v in params.items()}
     weights_np = np.asarray(final.weights, dtype=np.float64)
 
+    # Per-sample data log-likelihood under the same model used for SMC.
+    # Vmap over batch entries, then over particles within each entry.
+    def _ll_one_entry(data_one, particles_one):
+        _logprior, loglikelihood_fn = _make_model(
+            data_one,
+            has_pol=has_pol,
+            has_ar=has_ar,
+            gamma_beta_prior=tuple(float(v) for v in inv.gamma_beta_prior),
+            delta_beta_prior=tuple(float(v) for v in inv.delta_beta_prior),
+            amp_ratio_sigma_prior=float(inv.amp_ratio_sigma_prior),
+        )
+        del _logprior
+        return jax.vmap(loglikelihood_fn)(particles_one)
+
+    ln_p_np = np.asarray(
+        jax.vmap(_ll_one_entry)(data_b, final.particles), dtype=np.float64
+    )
+
     return {
         "params": params_np,
         "weights": weights_np,
+        "ln_p": ln_p_np,
         "lambda": lam,
         "stalled": stalled_final,
         "stall_guard_fired": stalled,
@@ -966,7 +1108,13 @@ def _run_bucket(
     }
 
 
-def _entry_result(params: Dict[str, np.ndarray], weights: np.ndarray, b: int, stalled: bool):
+def _entry_result(
+    params: Dict[str, np.ndarray],
+    weights: np.ndarray,
+    b: int,
+    stalled: bool,
+    ln_p: Optional[np.ndarray] = None,
+):
     """Build one ``InversionResult`` from row ``b`` of a bucket's output."""
     gamma_s = np.asarray(params["gamma"][b], dtype=float)
     delta_s = np.asarray(params["delta"][b], dtype=float)
@@ -986,6 +1134,10 @@ def _entry_result(params: Dict[str, np.ndarray], weights: np.ndarray, b: int, st
         sigma_ar_s = None
         sigma_ar_global_s = None
 
+    ln_p_b = None
+    if ln_p is not None:
+        ln_p_b = np.asarray(ln_p[b], dtype=float)
+
     return InversionResult(
         mt6=mt6,
         gamma=gamma_s,
@@ -993,7 +1145,7 @@ def _entry_result(params: Dict[str, np.ndarray], weights: np.ndarray, b: int, st
         kappa=kappa_s,
         h=h_s,
         sigma=sigma_s,
-        ln_p=None,
+        ln_p=ln_p_b,
         weights=np.asarray(weights[b], dtype=float),
         idata=None,
         sigma_amp_ratio=sigma_ar_s,
@@ -1081,9 +1233,9 @@ def run_batched(
     Parameters
     ----------
     inv : InversionBlackJAX
-        Configured sampler.  Only the ``adaptive_tempered`` + MWG + global
-        AR-noise + ``dc=False`` configuration is supported; anything else
-        raises :class:`NotImplementedError`.
+        Configured sampler.  Supports ``adaptive_tempered`` + global AR-noise +
+        ``dc=False`` with ``mcmc_kernel`` in ``{'rmh', 'irmh', 'mwg_irmh'}``;
+        anything else raises :class:`NotImplementedError`.
     events : sequence of (event_id, DataDict)
         Events to invert.
     smc_dtype : {'float64', 'float32'}
@@ -1198,7 +1350,11 @@ def run_batched(
                 (
                     entry.chain_index,
                     _entry_result(
-                        out["params"], out["weights"], b, bool(out["stalled"][b])
+                        out["params"],
+                        out["weights"],
+                        b,
+                        bool(out["stalled"][b]),
+                        ln_p=out.get("ln_p"),
                     ),
                 )
             )

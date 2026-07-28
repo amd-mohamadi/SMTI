@@ -48,6 +48,12 @@ from .mwg_kernel import (
     default_mwg_blocks,
     default_inner_steps,
 )
+from .irmh_kernel import (
+    build_gmm_parameter_update_fn,
+    build_hybrid_mwg_irmh_step_fn,
+    build_irmh_step_fn,
+    initial_gmm_parameter_value,
+)
 from .tape_jax import jax_Tape_MT6, jax_Tape_MT6_batch
 from .data_prep import (
     polarity_matrix,
@@ -131,6 +137,9 @@ def _blackjax_process_chain_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         mcmc_kernel=payload["mcmc_kernel"],
         rmh_proposal_scale=payload["rmh_proposal_scale"],
         mechanism_steps=payload["mechanism_steps"],
+        irmh_n_components=payload.get("irmh_n_components", 3),
+        irmh_steps=payload.get("irmh_steps", 1),
+        irmh_em_iters=payload.get("irmh_em_iters", 8),
         nuts_adapt_steps=payload["nuts_adapt_steps"],
         nuts_initial_step_size=payload["nuts_initial_step_size"],
         nuts_target_acceptance=payload["nuts_target_acceptance"],
@@ -175,7 +184,11 @@ class InversionResult:
     gamma, delta, kappa, h, sigma : np.ndarray
         Tape parameters for each sample, shape (n_samples,).
     ln_p : np.ndarray
-        Log-likelihood for each sample (placeholder).
+        Per-sample log-likelihood under the BlackJAX model (polarity +
+        amplitude-ratio terms only; no prior). Shape matches the sample axis
+        of ``gamma`` (``(n_samples,)`` single-chain, or ``(num_chains,
+        n_samples)`` when stacked). ``None`` only for legacy pickles / paths
+        that never evaluated the likelihood.
     weights : np.ndarray
         Normalized posterior weights for each sample.
     idata : Any
@@ -273,6 +286,9 @@ class InversionBlackJAX:
         smc_method: str = "adaptive_tempered",
         ps_target_ess: float = 5.0,
         mechanism_steps: int = 3,
+        irmh_n_components: int = 3,
+        irmh_steps: int = 1,
+        irmh_em_iters: int = 8,
         **kwargs: Any,
     ) -> None:
         # Normalize data to a list
@@ -321,9 +337,20 @@ class InversionBlackJAX:
             raise ValueError("amp_ratio_smooth_strength must be >= 0.")
         self.num_mcmc_steps = num_mcmc_steps
         self.mcmc_kernel = str(mcmc_kernel).lower()
-        if self.mcmc_kernel not in {"rmh", "nuts"}:
-            raise ValueError("mcmc_kernel must be one of {'rmh', 'nuts'}")
+        if self.mcmc_kernel not in {"rmh", "nuts", "irmh", "mwg_irmh"}:
+            raise ValueError(
+                "mcmc_kernel must be one of {'rmh', 'nuts', 'irmh', 'mwg_irmh'}"
+            )
         self.rmh_proposal_scale = float(rmh_proposal_scale)
+        self.irmh_n_components = int(irmh_n_components)
+        if self.irmh_n_components < 1:
+            raise ValueError("irmh_n_components must be >= 1")
+        self.irmh_steps = int(irmh_steps)
+        if self.irmh_steps < 1:
+            raise ValueError("irmh_steps must be >= 1")
+        self.irmh_em_iters = int(irmh_em_iters)
+        if self.irmh_em_iters < 1:
+            raise ValueError("irmh_em_iters must be >= 1")
         self.nuts_adapt_steps = nuts_adapt_steps
         self.nuts_initial_step_size = nuts_initial_step_size
         self.nuts_target_acceptance = nuts_target_acceptance
@@ -340,6 +367,17 @@ class InversionBlackJAX:
         if self.smc_method not in {"adaptive_tempered", "adaptive_persistent"}:
             raise ValueError(
                 "smc_method must be one of {'adaptive_tempered', 'adaptive_persistent'}"
+            )
+        if self.smc_method == "adaptive_persistent" and self.mcmc_kernel in {
+            "irmh",
+            "mwg_irmh",
+        }:
+            raise NotImplementedError(
+                "smc_method='adaptive_persistent' does not support "
+                f"mcmc_kernel={self.mcmc_kernel!r}: the persistent branch runs the "
+                "rejuvenation kernel with fixed parameters and cannot carry the "
+                "stage-refitted GMM proposal leaves. Use "
+                "smc_method='adaptive_tempered', or mcmc_kernel in {'rmh', 'nuts'}."
             )
         self.ps_target_ess = float(ps_target_ess)
         self.mechanism_steps = int(mechanism_steps)
@@ -429,6 +467,11 @@ class InversionBlackJAX:
             "kappa": np.asarray(result.kappa, dtype=float),
             "h": np.asarray(result.h, dtype=float),
             "sigma": np.asarray(result.sigma, dtype=float),
+            "ln_p": (
+                None
+                if result.ln_p is None
+                else np.asarray(result.ln_p, dtype=float)
+            ),
             "weights": np.asarray(result.weights, dtype=float),
             "sigma_amp_ratio": (
                 None
@@ -455,6 +498,7 @@ class InversionBlackJAX:
 
     @staticmethod
     def _deserialize_chain_result(payload: Dict[str, Any]) -> InversionResult:
+        ln_p_raw = payload.get("ln_p", None)
         return InversionResult(
             mt6=np.asarray(payload["mt6"], dtype=float),
             gamma=np.asarray(payload["gamma"], dtype=float),
@@ -462,7 +506,7 @@ class InversionBlackJAX:
             kappa=np.asarray(payload["kappa"], dtype=float),
             h=np.asarray(payload["h"], dtype=float),
             sigma=np.asarray(payload["sigma"], dtype=float),
-            ln_p=None,
+            ln_p=(None if ln_p_raw is None else np.asarray(ln_p_raw, dtype=float)),
             weights=np.asarray(payload["weights"], dtype=float),
             idata=None,
             sigma_amp_ratio=(
@@ -593,6 +637,9 @@ class InversionBlackJAX:
                     "mcmc_kernel": self.mcmc_kernel,
                     "rmh_proposal_scale": self.rmh_proposal_scale,
                     "mechanism_steps": self.mechanism_steps,
+                    "irmh_n_components": self.irmh_n_components,
+                    "irmh_steps": self.irmh_steps,
+                    "irmh_em_iters": self.irmh_em_iters,
                     "nuts_adapt_steps": self.nuts_adapt_steps,
                     "nuts_initial_step_size": self.nuts_initial_step_size,
                     "nuts_target_acceptance": self.nuts_target_acceptance,
@@ -783,7 +830,11 @@ class InversionBlackJAX:
                         kappa=_pad_1d(r.kappa, max_n),
                         h=_pad_1d(r.h, max_n),
                         sigma=_pad_1d(r.sigma, max_n),
-                        ln_p=None,
+                        ln_p=(
+                            _pad_1d(np.asarray(r.ln_p, dtype=float), max_n)
+                            if r.ln_p is not None
+                            else None
+                        ),
                         weights=_pad_weights(r.weights, max_n),
                         idata=None,
                         sigma_amp_ratio=(
@@ -807,6 +858,12 @@ class InversionBlackJAX:
                 )
             chain_results = padded
 
+        ln_p_stack = None
+        if all(r.ln_p is not None for r in chain_results):
+            ln_p_stack = np.stack(
+                [np.asarray(r.ln_p, dtype=float) for r in chain_results], axis=0
+            )
+
         return InversionResult(
             mt6=np.stack([r.mt6 for r in chain_results], axis=0),
             gamma=np.stack([r.gamma for r in chain_results], axis=0),
@@ -814,7 +871,7 @@ class InversionBlackJAX:
             kappa=np.stack([r.kappa for r in chain_results], axis=0),
             h=np.stack([r.h for r in chain_results], axis=0),
             sigma=np.stack([r.sigma for r in chain_results], axis=0),
-            ln_p=None,
+            ln_p=ln_p_stack,
             weights=np.stack([r.weights for r in chain_results], axis=0),
             idata=None,
             sigma_amp_ratio=(
@@ -1523,6 +1580,98 @@ class InversionBlackJAX:
 
             mcmc_init_fn = blackjax.nuts.init
             _emit_progress("Using BlackJAX SMC rejuvenation kernel: NUTS")
+        elif self.mcmc_kernel in {"irmh", "mwg_irmh"}:
+            # --- Independence MH (optional hybrid with MWG local polish) ---
+            mcmc_init_fn = blackjax.rmh.init
+            use_blockwise = True  # reuse inner_kernel_tuning path
+            field_names = list(initial_particles.keys())
+            # The IRMH pack/unpack helpers assume one scalar per particle per
+            # field; a vector field (e.g. amp_ratio_noise_mode='individual')
+            # would only fail later with an opaque reshape error inside tracing.
+            non_scalar = {
+                name: tuple(jnp.shape(initial_particles[name])[1:])
+                for name in field_names
+                if jnp.ndim(initial_particles[name]) != 1
+            }
+            if non_scalar:
+                raise NotImplementedError(
+                    f"mcmc_kernel={self.mcmc_kernel!r} supports only scalar "
+                    "per-particle fields, but these fields are vector-valued: "
+                    f"{non_scalar} (per-particle trailing shapes). Use "
+                    "mcmc_kernel='rmh' or amp_ratio_noise_mode='global'."
+                )
+            blocks = default_mwg_blocks(
+                dc=dc,
+                has_ar=has_ar,
+                noise_fields=amp_ratio_noise_fields,
+            )
+            inner_steps = default_inner_steps(mechanism_steps=self.mechanism_steps)
+            initial_stds_by_field = {
+                name: float(jnp.std(initial_particles[name])) for name in field_names
+            }
+            initial_scales = build_blockwise_scale_overrides(
+                blocks=blocks,
+                initial_stds=initial_stds_by_field,
+                current_stds=initial_stds_by_field,
+            )
+            gmm0 = initial_gmm_parameter_value(
+                initial_particles,
+                field_names,
+                n_components=self.irmh_n_components,
+                n_iters=self.irmh_em_iters,
+                rng_key=random.PRNGKey(self.random_seed ^ 0xA11CE),
+            )
+
+            if self.mcmc_kernel == "mwg_irmh":
+                mwg_step_fn = build_hybrid_mwg_irmh_step_fn(
+                    field_names=field_names,
+                    blocks=blocks,
+                    inner_steps_per_block=inner_steps,
+                    n_components=self.irmh_n_components,
+                    n_irmh_steps=self.irmh_steps,
+                )
+                mwg_scale_update = build_mwg_parameter_update_fn(
+                    blocks=blocks,
+                    field_names=field_names,
+                    initial_stds=initial_stds_by_field,
+                )
+                mcmc_parameter_update_fn = build_gmm_parameter_update_fn(
+                    field_names=field_names,
+                    n_components=self.irmh_n_components,
+                    n_iters=self.irmh_em_iters,
+                    mwg_update_fn=mwg_scale_update,
+                )
+                initial_parameter_value = {
+                    **{
+                        name: jnp.asarray(scale)[None]
+                        for name, scale in initial_scales.items()
+                    },
+                    **gmm0,
+                }
+                block_names_str = ", ".join(
+                    f"{b.name}(x{inner_steps.get(b.name, 1)})" for b in blocks
+                )
+                _emit_progress(
+                    f"Using hybrid MWG+IRMH kernel: IRMH steps={self.irmh_steps}, "
+                    f"K={self.irmh_n_components}, blocks=[{block_names_str}]"
+                )
+            else:
+                mwg_step_fn = build_irmh_step_fn(
+                    field_names=field_names,
+                    n_components=self.irmh_n_components,
+                    n_irmh_steps=self.irmh_steps,
+                )
+                mcmc_parameter_update_fn = build_gmm_parameter_update_fn(
+                    field_names=field_names,
+                    n_components=self.irmh_n_components,
+                    n_iters=self.irmh_em_iters,
+                    mwg_update_fn=None,
+                )
+                initial_parameter_value = dict(gmm0)
+                _emit_progress(
+                    f"Using pure IRMH kernel: steps={self.irmh_steps}, "
+                    f"K={self.irmh_n_components}"
+                )
         else:
             rmh_kernel = blackjax_rw.build_additive_step()
             mcmc_init_fn = blackjax.rmh.init
@@ -1754,16 +1903,20 @@ class InversionBlackJAX:
             # persistent_particles: {field: (n_iter+1, n_particles)}
             # persistent_weights:   (n_iter+1, n_particles)
             # Flatten across iterations to get all accumulated samples
-            flat_particles = jax.tree.map(
+            particles_u = jax.tree.map(
                 lambda x: x.reshape((-1,) + x.shape[2:]), smc_st.persistent_particles
             )
-            particles_phys = _unconstrained_to_params(flat_particles)
+            particles_phys = _unconstrained_to_params(particles_u)
 
             raw_pw = np.asarray(smc_st.persistent_weights).reshape(-1)
             final_weights = raw_pw / raw_pw.sum()
         else:
-            particles_phys = _unconstrained_to_params(smc_st.particles)
+            particles_u = smc_st.particles
+            particles_phys = _unconstrained_to_params(particles_u)
             final_weights = np.asarray(smc_st.weights)
+
+        # Per-sample data log-likelihood (same model as SMC; no prior term).
+        ln_p = np.asarray(jax.vmap(loglikelihood_fn)(particles_u), dtype=float)
 
         gamma_s = np.asarray(particles_phys["gamma"])
         delta_s = np.asarray(particles_phys["delta"])
@@ -1807,7 +1960,7 @@ class InversionBlackJAX:
             kappa=kappa_s,
             h=h_s,
             sigma=sigma_s,
-            ln_p=None,
+            ln_p=ln_p,
             weights=final_weights,
             idata=None,
             sigma_amp_ratio=sigma_ar_s,
