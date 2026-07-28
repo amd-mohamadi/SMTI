@@ -289,6 +289,7 @@ def prepare_batch(
     inv: Any,
     events: Sequence[Tuple[str, DataDict]],
     pad_multiple: int = PAD_MULTIPLE,
+    per_event_seeds: bool = False,
 ) -> List[Bucket]:
     """Turn ``(event_id, event)`` pairs into shape-bucketed, stacked batches.
 
@@ -318,6 +319,16 @@ def prepare_batch(
         :func:`run_batched`.
     pad_multiple : int
         Bucket granularity for the observation counts.
+    per_event_seeds : bool
+        ``False`` (default) reproduces ``forward()`` exactly: every event of the
+        batch gets the SAME chain seeds, so entry ``b`` is bit-identical to its
+        unbatched twin -- which is what the equivalence tests check, but which
+        also means two events in one batch share their initial particle cloud
+        and their whole SMC key stream (common random numbers, correlated
+        Monte-Carlo error).  ``True`` gives event ``i`` its own stream via
+        ``SeedSequence(inv.random_seed).spawn(len(events))[i]``, which is what a
+        catalogue-scale driver wants; event-vs-unbatched parity is then only
+        statistical.
 
     Returns
     -------
@@ -336,12 +347,23 @@ def prepare_batch(
             "internally)."
         )
 
-    if inv.num_chains == 1:
+    if per_event_seeds:
+        # One independent stream per event: entry (event i, chain c) shares
+        # nothing with (event j, chain c). Uses SeedSequence.spawn, which is
+        # designed exactly for this.
+        children = np.random.SeedSequence(inv.random_seed).spawn(len(events))
+        chain_seeds_per_event = [
+            [int(s) for s in child.generate_state(max(1, int(inv.num_chains)))]
+            for child in children
+        ]
+    elif inv.num_chains == 1:
         # forward() calls _invert_single_event directly, which seeds with
         # random.PRNGKey(self.random_seed) -- no SeedSequence derivation.
+        chain_seeds_per_event = None
         chain_seeds = [int(inv.random_seed)]
     else:
         ss = np.random.SeedSequence(inv.random_seed)
+        chain_seeds_per_event = None
         chain_seeds = [int(s) for s in ss.generate_state(inv.num_chains)]
 
     buckets: Dict[Tuple[int, int, int, bool, bool], Bucket] = {}
@@ -351,9 +373,11 @@ def prepare_batch(
         filtered = inv._filter_event_by_options(event)
 
         # One station-angle realization per event, shared by its chains.
+        # The RNG is derived from (random_seed, UID) so the realization does
+        # not depend on batch composition and matches the unbatched path.
         location_samples = build_location_samples_from_errors(
             filtered,
-            rng=inv.rng,
+            rng=inv._location_rng(filtered),
             n_samples=inv.location_samples_n,
             azimuth_error=inv.azimuth_error,
             takeoff_error=inv.takeoff_error,
@@ -385,7 +409,11 @@ def prepare_batch(
             pending[key] = []
 
         padded = _pad_event_arrays(prep, key[0], key[1], n_loc)
-        for chain_index, seed in enumerate(chain_seeds):
+        event_chain_seeds = (
+            chain_seeds if chain_seeds_per_event is None
+            else chain_seeds_per_event[event_index]
+        )
+        for chain_index, seed in enumerate(event_chain_seeds):
             buckets[key].entries.append(
                 BatchEntry(
                     event_id=str(event_id),
@@ -1046,6 +1074,7 @@ def run_batched(
     max_batch: Optional[int] = None,
     on_bucket_error: str = "skip",
     return_failures: bool = False,
+    per_event_seeds: bool = False,
 ):
     """Invert many events at once as bucketed, vmapped SMC programs.
 
@@ -1084,6 +1113,13 @@ def run_batched(
     return_failures : bool
         If True return ``(results, failures)`` where ``failures`` maps
         ``event_id -> reason`` for every event that could not be inverted.
+    per_event_seeds : bool
+        Give every event of the batch its own RNG stream instead of the shared,
+        ``forward()``-identical one (see :func:`prepare_batch`).  Drivers that
+        invert a catalogue should pass ``True``: with ``False`` the events of
+        one batch share their initial particles and key stream, so their
+        Monte-Carlo errors are correlated.  Default ``False`` keeps bit-level
+        equivalence with the unbatched path (what the M1 tests assert).
 
     Returns
     -------
@@ -1117,7 +1153,9 @@ def run_batched(
             "and before any array is created (see module docstring)."
         )
 
-    buckets = prepare_batch(inv, events, pad_multiple=pad_multiple)
+    buckets = prepare_batch(
+        inv, events, pad_multiple=pad_multiple, per_event_seeds=per_event_seeds
+    )
     chunks: List[Bucket] = []
     for bucket in buckets:
         chunks.extend(_chunk_bucket(bucket, max_batch))

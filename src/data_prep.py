@@ -11,12 +11,33 @@ These mirror the corresponding helpers in MTfit.inversion but use ndarrays.
 
 from __future__ import annotations
 
+import hashlib
 import operator
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 from .forward_model import station_angles
+
+
+def location_sample_rng(
+    base_seed: int, event_uid: Any
+) -> np.random.Generator:
+    """Deterministic per-event RNG for location-sample draws.
+
+    Seeds from ``(base_seed, sha256(event_uid))`` so the realization depends
+    only on the event identity and the base seed -- not on how many events
+    were processed before this one, nor on batch composition. This keeps the
+    unbatched and batched samplers bit-identical for the same event and makes
+    location samples independent across events even when every event is run
+    with the same ``base_seed``.
+    """
+    digest = hashlib.sha256(str(event_uid).encode("utf-8")).digest()
+    uid_words = [
+        int.from_bytes(digest[i : i + 4], "little") for i in range(0, 16, 4)
+    ]
+    entropy = [int(base_seed) & 0xFFFFFFFF, *uid_words]
+    return np.random.default_rng(np.random.SeedSequence(entropy))
 
 
 def build_location_samples_from_errors(
@@ -163,9 +184,12 @@ def build_location_samples_from_errors(
         az_sample = rng.normal(az_mu, az_sig)
         to_sample = rng.normal(to_mu, to_sig)
 
-        # Wrap angles to physical ranges
+        # Wrap angles to physical ranges. Take-off angles reflect at the
+        # 0/180 poles (mod-360 then fold) rather than clipping, so no
+        # probability mass accumulates at the boundaries.
         az_sample = np.mod(az_sample, 360.0)
-        to_sample = np.clip(to_sample, 0.0, 180.0)
+        to_sample = np.mod(to_sample, 360.0)
+        to_sample = np.where(to_sample > 180.0, 360.0 - to_sample, to_sample)
 
         samples.append(
             {

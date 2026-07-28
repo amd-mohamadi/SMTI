@@ -53,6 +53,7 @@ from .data_prep import (
     polarity_matrix,
     amplitude_ratio_matrix,
     build_location_samples_from_errors,
+    location_sample_rng,
 )
 
 
@@ -406,6 +407,19 @@ class InversionBlackJAX:
                 filtered[key] = value
         return filtered
 
+    def _location_rng(self, event: DataDict) -> np.random.Generator:
+        """RNG for this event's location-sample draws.
+
+        Derived from ``(random_seed, event UID)`` so the realization is
+        independent across events and identical between the unbatched and
+        batched samplers regardless of processing order or batch composition.
+        Falls back to the shared ``self.rng`` for events without a ``UID``.
+        """
+        uid = event.get("UID")
+        if uid is None:
+            return self.rng
+        return location_sample_rng(self.random_seed, uid)
+
     @staticmethod
     def _serialize_chain_result(result: InversionResult) -> Dict[str, Any]:
         return {
@@ -681,7 +695,7 @@ class InversionBlackJAX:
         # compares chains targeting the same posterior.
         location_samples = build_location_samples_from_errors(
             event,
-            rng=self.rng,
+            rng=self._location_rng(event),
             n_samples=self.location_samples_n,
             azimuth_error=self.azimuth_error,
             takeoff_error=self.takeoff_error,
@@ -942,7 +956,7 @@ class InversionBlackJAX:
         if location_samples is None:
             location_samples = build_location_samples_from_errors(
                 event,
-                rng=self.rng,
+                rng=self._location_rng(event),
                 n_samples=self.location_samples_n,
                 azimuth_error=self.azimuth_error,
                 takeoff_error=self.takeoff_error,
