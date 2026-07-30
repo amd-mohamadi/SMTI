@@ -9,6 +9,8 @@ This module provides helpers to:
 - Check for multimodality in MT6 space using a Gaussian mixture model.
 - Check for multimodality in parameter space (e.g. kappa, h, sigma) using HDBSCAN.
 - Quantify angular uncertainty around a reference MT (e.g. MAP or median).
+- Summarise a finished inversion: ArviZ posterior layout, max-likelihood MT6,
+  Tape parameter blocks, station counts and SKHASH-style coverage gaps.
 - Compute a scalar MT quality score from an InferenceData object.
 - Compute block-wise Qdc (orientation / Kagan) and Qndc (source type / lune) scores.
 - Generate MTfit-style synthetic events using the current forward model.
@@ -619,6 +621,180 @@ def angular_uncertainty(
         "angles_deg": angles_deg,
         "quantiles": q,
     }
+
+
+# ---------------------------------------------------------------------------
+# Inversion-result and station-coverage helpers
+#
+# Small, project-independent accessors over an ``InversionResult`` and over the
+# SMTI data dict returned by ``read_data``.  They are used when turning a
+# finished inversion into summary tables (ArviZ posteriors, max-likelihood MT6,
+# Tape parameter blocks, station counts and coverage gaps).
+# ---------------------------------------------------------------------------
+
+
+def as_arviz_posterior_array(samples):
+    """Reshape a posterior sample array to the ``(chain, draw)`` ArviZ layout.
+
+    Returns ``None`` when ``samples`` is empty or collapses to a scalar.
+    """
+    arr = np.asarray(samples, dtype=float)
+    if arr.size == 0:
+        return None
+    arr = np.squeeze(arr)
+    if arr.ndim == 0:
+        return None
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    if arr.ndim == 2:
+        return arr
+    return arr.reshape(arr.shape[0], -1)
+
+
+def find_max_likelihood_mt6(mt6_samples: np.ndarray, ln_p, fallback_vec, fallback_idx):
+    """Return the highest log-likelihood sample when log-likelihoods are available.
+
+    Falls back to ``fallback_vec`` / ``fallback_idx`` (typically the median)
+    with source ``"median"`` when ``ln_p`` is missing or unusable.
+    """
+    mt6_samples = np.asarray(mt6_samples, dtype=float)
+    n_samples = mt6_samples.shape[1]
+    if ln_p is None:
+        return np.asarray(fallback_vec, dtype=float), int(fallback_idx), "median"
+
+    ln_p = np.asarray(ln_p, dtype=float).reshape(-1)
+    if ln_p.size != n_samples:
+        return np.asarray(fallback_vec, dtype=float), int(fallback_idx), "median"
+
+    finite = np.isfinite(ln_p)
+    if not np.any(finite):
+        return np.asarray(fallback_vec, dtype=float), int(fallback_idx), "median"
+
+    idx = int(np.flatnonzero(finite)[np.argmax(ln_p[finite])])
+    return mt6_samples[:, idx], idx, "ln_p"
+
+
+def tape_param_array(result_obj, name: str):
+    """Return a Tape parameter array from InversionResult, or None if missing."""
+    arr = getattr(result_obj, name, None)
+    if arr is None:
+        return None
+    return np.asarray(arr, dtype=float)
+
+
+def n_chains_from_result(result_obj, kappa: np.ndarray | None) -> int | None:
+    """Infer chain count for orientation-mode diagnostics."""
+    n_chains = getattr(result_obj, "num_chains", None)
+    if n_chains is not None:
+        try:
+            n_chains = int(n_chains)
+            if n_chains >= 1:
+                return n_chains
+        except (TypeError, ValueError):
+            pass
+    if kappa is not None and np.asarray(kappa).ndim == 2:
+        return int(np.asarray(kappa).shape[0])
+    idata = getattr(result_obj, "idata", None)
+    if idata is not None and hasattr(idata, "posterior"):
+        try:
+            return int(idata.posterior.sizes.get("chain", 1))
+        except Exception:
+            pass
+    return None
+
+
+def station_geometry_by_name(data: dict) -> dict[str, tuple[float, float]]:
+    """Map every station name in ``data`` to its ``(azimuth, takeoff_angle)``.
+
+    The first observation type carrying a station wins; entries whose geometry
+    arrays do not line up with the name array are skipped.
+    """
+    geometry = {}
+    for entry in data.values():
+        if not isinstance(entry, dict):
+            continue
+        stations = entry.get("Stations")
+        if not isinstance(stations, dict):
+            continue
+        names = np.asarray(stations.get("Name", []), dtype=object).reshape(-1)
+        if names.size == 0:
+            continue
+        azimuth = np.asarray(stations.get("Azimuth", []), dtype=float).reshape(-1)
+        takeoff = np.asarray(stations.get("TakeOffAngle", []), dtype=float).reshape(-1)
+        if azimuth.size != names.size or takeoff.size != names.size:
+            continue
+        for name, az, to in zip(names, azimuth, takeoff):
+            geometry.setdefault(str(name), (float(az), float(to)))
+    return geometry
+
+
+def polarity_station_count(data: dict, key: str) -> int:
+    """Number of stations contributing to observation type ``key`` (0 if absent)."""
+    entry = data.get(key)
+    if not entry:
+        return 0
+    return int(np.asarray(entry["Stations"]["Name"], dtype=object).reshape(-1).size)
+
+
+def skhash_max_gaps(azimuth_deg, takeoff_deg):
+    """Max azimuthal/takeoff gaps following SKHASH functions/fun.py:determine_max_gap."""
+    azimuth_deg = np.asarray(azimuth_deg, dtype=float).reshape(-1).copy()
+    takeoff_deg = np.asarray(takeoff_deg, dtype=float).reshape(-1).copy()
+    if azimuth_deg.size == 0:
+        return np.nan, np.nan
+    # Fold upgoing rays onto the lower hemisphere
+    azimuth_deg[takeoff_deg > 90] -= 180
+    takeoff_deg[takeoff_deg > 90] = 180 - takeoff_deg[takeoff_deg > 90]
+    azimuth_deg[azimuth_deg < 0] += 360
+    azimuth_deg = np.sort(azimuth_deg)
+    takeoff_deg = np.sort(takeoff_deg)
+    diffs_az = np.diff(azimuth_deg) if azimuth_deg.size > 1 else np.array([0.0])
+    diffs_to = np.diff(takeoff_deg) if takeoff_deg.size > 1 else np.array([0.0])
+    max_azimuthal_gap = np.max([np.max(diffs_az), azimuth_deg[0] + 360 - azimuth_deg[-1]])
+    max_takeoff_gap = np.max([np.max(diffs_to), takeoff_deg[0], 90 - takeoff_deg[-1]])
+    return float(max_azimuthal_gap), float(max_takeoff_gap)
+
+
+def station_names_for_data_key(data: dict, key: str) -> set[str]:
+    """Set of station names carrying observation type ``key`` (empty if absent)."""
+    entry = data.get(key)
+    if not entry:
+        return set()
+
+    stations = entry.get("Stations", {})
+    names = stations.get("Name", [])
+    return {str(name) for name in np.asarray(names).reshape(-1)}
+
+
+def usable_p_s_stations(data: dict) -> set[str]:
+    """Stations that carry both P and S information in ``data``.
+
+    A station counts once it appears in at least one P-capable and one
+    S-capable observation type; the intersection is the usual step-4 QC
+    measure of how well an event is constrained.
+    """
+    p_capable_keys = (
+        "PPolarity",
+        "P/SHAmplitudeRatio",
+        "P/SVAmplitudeRatio",
+    )
+    s_capable_keys = (
+        "SHPolarity",
+        "SVPolarity",
+        "P/SHAmplitudeRatio",
+        "P/SVAmplitudeRatio",
+        "SH/SVAmplitudeRatio",
+    )
+
+    p_capable = set()
+    for key in p_capable_keys:
+        p_capable.update(station_names_for_data_key(data, key))
+
+    s_capable = set()
+    for key in s_capable_keys:
+        s_capable.update(station_names_for_data_key(data, key))
+
+    return p_capable & s_capable
 
 
 # ---------------------------------------------------------------------------
