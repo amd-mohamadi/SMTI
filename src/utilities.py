@@ -896,7 +896,9 @@ def orientation_matrices(
         Shape ``(n, 3, 3)`` with columns T, N, P for each sample.
     """
     k = _as_1d(kappa)
-    hh = np.clip(_as_1d(h), 0.0, 1.0)
+    # h < 0 (dip > 90 deg) is a valid canonicalized representation of a
+    # folded near-vertical plane; only guard the arccos domain.
+    hh = np.clip(_as_1d(h), -1.0, 1.0)
     s = _as_1d(sigma)
     n = k.size
     if hh.size != n or s.size != n:
@@ -1011,6 +1013,56 @@ def _circular_mean(angles_rad: np.ndarray) -> float:
     return float(np.arctan2(np.mean(np.sin(a)), np.mean(np.cos(a))))
 
 
+def _canonicalize_orientation(
+    k: np.ndarray,
+    hh: np.ndarray,
+    ss: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Fold the fault-plane representation degeneracy onto one strike sheet.
+
+    ``(kappa, h, sigma)`` and ``(kappa + pi, -h, -sigma)`` describe the same
+    double couple, and the sampler's ``dip <= 90`` domain splits a posterior
+    that straddles the vertical-dip boundary into two antipodal strike
+    clusters. Samples in the half-circle opposite the doubled-angle mean
+    strike are flipped onto the other representation; flipped samples carry
+    ``h < 0`` (dip > 90 deg), which downstream Kagan computations accept.
+    """
+    z2 = complex(np.sum(np.exp(2j * k)))
+    if not np.isfinite(z2) or z2 == 0:
+        return k, hh, ss
+    k_ref = 0.5 * float(np.angle(z2))
+    # of the two antipodal reference branches, keep the majority unflipped
+    if float(np.sum(np.cos(k - k_ref))) < 0.0:
+        k_ref += np.pi
+    flip = np.cos(k - k_ref) < 0.0
+    if not np.any(flip):
+        return k, hh, ss
+    return (
+        np.where(flip, np.mod(k + np.pi, 2.0 * np.pi), k),
+        np.where(flip, -hh, hh),
+        np.where(flip, -ss, ss),
+    )
+
+
+def _fold_back_sdr(
+    kappa_rad: float,
+    h_val: float,
+    sigma_rad: float,
+) -> Tuple[float, float, float]:
+    """Convert a (possibly canonicalized, h < 0) Tape orientation to
+    strike/dip/rake degrees in the standard ``dip <= 90`` convention."""
+    if h_val < 0.0:
+        kappa_rad += np.pi
+        h_val = -h_val
+        sigma_rad = -sigma_rad
+    return (
+        float(np.degrees(kappa_rad) % 360.0),
+        float(np.degrees(np.arccos(np.clip(h_val, 0.0, 1.0)))),
+        float(np.degrees(sigma_rad)),
+    )
+
+
 def _angle_quantile_score(
     q_deg: float,
     angle_good: float,
@@ -1111,6 +1163,8 @@ def cluster_orientation_params(
     mode_min_kagan_deg: float = 15.0,
     k_max: int = 6,
     seed: int = 0,
+    canonicalize: bool = True,
+    mode_representative: str = "medoid",
 ) -> Dict[str, Any]:
     """
     Select orientation components by GMM+BIC and merge physical DC modes.
@@ -1119,7 +1173,18 @@ def cluster_orientation_params(
     Components below ``mode_min_weight`` are removed from the soft-weight
     normalization, while their hard-assigned samples are reassigned to the
     nearest surviving mode for strike/dip/rake summaries.
+
+    ``canonicalize=True`` folds the ``(kappa, h, sigma) ~ (kappa+pi, -h,
+    -sigma)`` representation degeneracy onto one strike sheet before mode
+    fitting, so near-vertical posteriors straddling ``dip = 90`` form one
+    cluster instead of two antipodal ones. ``mode_representative="medoid"``
+    replaces the embedding-mean cluster representative with the member
+    sample of minimum mean Kagan distance to the cluster; unlike the mean,
+    a medoid cannot land between antipodal strike clusters on a mechanism
+    no sample is close to.
     """
+    if mode_representative not in ("mean", "medoid"):
+        raise ValueError(f"unknown mode_representative: {mode_representative!r}")
     k_arr = np.asarray(kappa, dtype=float)
     h_arr = np.asarray(h, dtype=float)
     s_arr = np.asarray(sigma, dtype=float)
@@ -1127,6 +1192,8 @@ def cluster_orientation_params(
     k = _as_1d(k_arr)
     hh = _as_1d(h_arr)
     ss = _as_1d(s_arr)
+    if canonicalize and k.size:
+        k, hh, ss = _canonicalize_orientation(k, hh, ss)
     n = k.size
     nan = float("nan")
     if hh.size != n or ss.size != n:
@@ -1189,13 +1256,30 @@ def cluster_orientation_params(
         if np.any(raw_labels == component)
     ]
 
+    def _member_medoid(members: np.ndarray) -> Tuple[float, float, float]:
+        # Kagan medoid on deterministic evenly-spaced subsamples: candidate
+        # member minimizing the mean Kagan distance to the cluster.
+        cands = members[np.unique(np.linspace(0, members.size - 1, min(members.size, 32)).astype(int))]
+        targets = members[np.unique(np.linspace(0, members.size - 1, min(members.size, 256)).astype(int))]
+        cost = [
+            float(np.mean(kagan_angles_deg(k[c], hh[c], ss[c], k[targets], hh[targets], ss[targets])))
+            for c in cands
+        ]
+        best = int(cands[int(np.argmin(cost))])
+        return float(k[best]), float(hh[best]), float(ss[best])
+
     def representative(cluster: Dict[str, Any]) -> Tuple[float, float, float]:
-        members = cluster["members"]
-        return (
-            _circular_mean(k[members]),
-            float(np.median(hh[members])),
-            float(np.median(ss[members])),
-        )
+        if "rep" not in cluster:
+            members = cluster["members"]
+            if mode_representative == "medoid":
+                cluster["rep"] = _member_medoid(members)
+            else:
+                cluster["rep"] = (
+                    _circular_mean(k[members]),
+                    float(np.median(hh[members])),
+                    float(np.median(ss[members])),
+                )
+        return cluster["rep"]
 
     while len(clusters) > 1:
         pairs = [
@@ -1242,6 +1326,7 @@ def cluster_orientation_params(
         for survivor_index, survivor in enumerate(survivors):
             assigned = members[nearest == survivor_index]
             survivor["members"] = np.concatenate([survivor["members"], assigned])
+            survivor.pop("rep", None)
 
     weight_sum = float(sum(cluster["weight"] for cluster in survivors))
     for cluster in survivors:
@@ -1257,11 +1342,14 @@ def cluster_orientation_params(
         members = cluster["members"]
         precision_members = cluster["precision_members"]
         labels[members] = mode_index
-        strike = float(np.degrees(_circular_mean(k[members])) % 360.0)
-        dip = float(
-            np.degrees(np.arccos(np.clip(np.mean(hh[members]), 0.0, 1.0)))
-        )
-        rake = float(np.degrees(np.mean(ss[members])))
+        if mode_representative == "medoid":
+            strike, dip, rake = _fold_back_sdr(*representative(cluster))
+        else:
+            strike, dip, rake = _fold_back_sdr(
+                _circular_mean(k[members]),
+                float(np.mean(hh[members])),
+                float(np.mean(ss[members])),
+            )
         mode_ref = representative(
             {"members": precision_members}
         )
@@ -1553,6 +1641,8 @@ def mt_quality_scores_dc_ndc(
     k_max: int = 6,
     ess_healthy_bic: float = ESS_HEALTHY_BIC,
     cluster_seed: int = 0,
+    dc_canonicalize: bool = True,
+    dc_mode_representative: str = "medoid",
 ) -> Dict[str, Any]:
     """
     Compute separate orientation (Qdc) and source-type (Qndc) quality scores.
@@ -1597,6 +1687,16 @@ def mt_quality_scores_dc_ndc(
         Warn when a fitted block has bulk ESS below this threshold.
     cluster_seed : int
         GMM random seed.
+    dc_canonicalize : bool
+        Fold the ``(kappa, h, sigma) ~ (kappa+pi, -h, -sigma)`` fault-plane
+        representation degeneracy onto one strike sheet before orientation
+        mode fitting (see ``cluster_orientation_params``).
+    dc_mode_representative : {"mean", "medoid"}
+        Orientation-mode representative used for merge decisions and
+        within-mode Kagan quantiles. ``"medoid"`` is robust to antipodal
+        strike clusters of near-vertical planes, where the embedding mean
+        lands on a mechanism no sample is close to and ``s_prec_dc``
+        collapses spuriously.
 
     Returns
     -------
@@ -1673,6 +1773,8 @@ def mt_quality_scores_dc_ndc(
         mode_min_kagan_deg=mode_min_kagan_deg,
         k_max=k_max,
         seed=cluster_seed,
+        canonicalize=dc_canonicalize,
+        mode_representative=dc_mode_representative,
     )
     q50_k = float(cluster["dc_q50_within_mode_deg"])
     q90_k = float(cluster["dc_q90_within_mode_deg"])

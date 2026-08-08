@@ -370,6 +370,47 @@ def test_dc_constraint_nan_qndc():
     assert np.isfinite(sc["Qdc"])
 
 
+def test_vertical_dip_antipodal_split_not_spurious():
+    """A tight posterior straddling dip=90 must not collapse s_prec_dc.
+
+    (kappa, h, sigma) and (kappa+pi, -h, -sigma) are the same double couple,
+    so the sampler's dip<=90 domain splits a near-vertical posterior into two
+    antipodal strike clusters. The embedding-mean representative of the
+    merged mode lands between the clusters on a mechanism no sample is close
+    to, inflating the within-mode Kagan quantiles (regression: CAPE catalog
+    events with q50 ~ 58 deg and s_prec_dc = 0 for ~8 deg posteriors).
+    """
+    rng = np.random.default_rng(7)
+    n = 2000
+    kappa_true = np.radians(75.0) + rng.normal(0.0, np.radians(2.0), n)
+    h_true = rng.uniform(-0.06, 0.06, n)  # dip straddles 90 deg
+    sigma_true = np.radians(10.0) + rng.normal(0.0, np.radians(3.0), n)
+    # fold into the sampler's dip<=90 domain
+    fold = h_true < 0.0
+    kappa = np.where(fold, np.mod(kappa_true + np.pi, 2.0 * np.pi), kappa_true)
+    h = np.abs(h_true)
+    sigma = np.where(fold, -sigma_true, sigma_true)
+
+    fixed = cluster_orientation_params(kappa, h, sigma)
+    assert fixed["n_modes_dc"] == 1
+    assert fixed["dc_q50_within_mode_deg"] < 10.0
+    # the representative is a member mechanism, close to the true plane
+    ref = kagan_angle_deg(
+        np.radians(fixed["dc_mode0_strike_deg"]),
+        np.cos(np.radians(fixed["dc_mode0_dip_deg"])),
+        np.radians(fixed["dc_mode0_rake_deg"]),
+        np.radians(75.0),
+        0.0,
+        np.radians(10.0),
+    )
+    assert ref < 10.0
+
+    legacy = cluster_orientation_params(
+        kappa, h, sigma, canonicalize=False, mode_representative="mean"
+    )
+    assert legacy["dc_q50_within_mode_deg"] > 30.0  # the documented bug
+
+
 if __name__ == "__main__":
     import traceback
 
