@@ -209,10 +209,12 @@ class InversionResult:
     sigma_amp_ratio_station: Optional[np.ndarray] = None
     sigma_amp_ratio_station_names: Optional[np.ndarray] = None
     num_chains: int = 1
-    #: True when SMC stopped on the tempering-stall guard instead of reaching
-    #: beta = 1 (set per chain by the batched path; stacked results report
-    #: True if any chain stalled).
+    #: True when SMC stopped short of beta = 1, on the tempering-stall guard or
+    #: on max_smc_iterations. Stacked results report True if any chain did.
     tempering_stalled: bool = False
+    #: Tempering value of the returned samples (1.0 for a complete run). Stacked
+    #: results report the lowest chain value; None for older saved results.
+    final_beta: Optional[float] = None
 
 
 class InversionBlackJAX:
@@ -494,6 +496,7 @@ class InversionBlackJAX:
                 else np.asarray(result.sigma_amp_ratio_station_names, dtype=object)
             ),
             "tempering_stalled": bool(result.tempering_stalled),
+            "final_beta": result.final_beta,
         }
 
     @staticmethod
@@ -530,6 +533,7 @@ class InversionBlackJAX:
                 else np.asarray(payload["sigma_amp_ratio_station_names"], dtype=object)
             ),
             tempering_stalled=bool(payload.get("tempering_stalled", False)),
+            final_beta=payload.get("final_beta"),
         )
 
     @staticmethod
@@ -854,6 +858,7 @@ class InversionBlackJAX:
                         ),
                         sigma_amp_ratio_station_names=r.sigma_amp_ratio_station_names,
                         tempering_stalled=r.tempering_stalled,
+                        final_beta=r.final_beta,
                     )
                 )
             chain_results = padded
@@ -892,6 +897,10 @@ class InversionBlackJAX:
             sigma_amp_ratio_station_names=chain_results[0].sigma_amp_ratio_station_names,
             num_chains=self.num_chains,
             tempering_stalled=any(bool(r.tempering_stalled) for r in chain_results),
+            final_beta=min(
+                (r.final_beta for r in chain_results if r.final_beta is not None),
+                default=None,
+            ),
         )
 
     @staticmethod
@@ -1261,60 +1270,33 @@ class InversionBlackJAX:
             """Log-prior in unconstrained space (includes Jacobians)."""
             log_p = 0.0
 
+            # log_sigmoid gives log(x) and log(1 - x) for x = sigmoid(u) without
+            # a floor, so the density keeps decaying in the tails and the target
+            # stays normalizable in unconstrained space.
             if not dc:
                 ug = position["gamma"]
                 ud = position["delta"]
 
-                g_raw = jnn.sigmoid(ug)
-                d_raw = jnn.sigmoid(ud)
-
-                # Beta priors on raw variables
+                # Beta(a, b) on sigmoid(u) times the Jacobian x(1 - x). The linear
+                # map to physical gamma/delta only adds a constant, which is dropped.
                 g_a, g_b = self.gamma_beta_prior
                 d_a, d_b = self.delta_beta_prior
-
-                log_beta_g = (
-                    (g_a - 1.0) * jnp.log(g_raw + eps)
-                    + (g_b - 1.0) * jnp.log1p(-g_raw + eps)
+                log_p += (
+                    g_a * jnn.log_sigmoid(ug)
+                    + g_b * jnn.log_sigmoid(-ug)
                     - jsp.special.betaln(g_a, g_b)
                 )
-                log_beta_d = (
-                    (d_a - 1.0) * jnp.log(d_raw + eps)
-                    + (d_b - 1.0) * jnp.log1p(-d_raw + eps)
+                log_p += (
+                    d_a * jnn.log_sigmoid(ud)
+                    + d_b * jnn.log_sigmoid(-ud)
                     - jsp.special.betaln(d_a, d_b)
                 )
 
-                # Jacobians for transforms (range constants dropped)
-                log_jac_g = jnp.log(g_raw + eps) + jnp.log1p(-g_raw + eps)
-                log_jac_d = jnp.log(d_raw + eps) + jnp.log1p(-d_raw + eps)
-
-                log_p += log_beta_g + log_jac_g
-                log_p += log_beta_d + log_jac_d
-
-            # Uniform priors with Jacobians for kappa, h, sigma
-            uk = position["kappa"]
-            uh = position["h"]
-            us = position["sigma"]
-
-            k_raw = jnn.sigmoid(uk)
-            h_raw = jnn.sigmoid(uh)
-            s_raw = jnn.sigmoid(us)
-
-            # kappa ~ Uniform(0, 2π) in physical space.
-            # We parameterize via k_raw = sigmoid(uk) and kappa = 2π * k_raw.
-            log_unif_kappa = -jnp.log(2.0 * jnp.pi)
-            log_jac_kappa = (
-                jnp.log(2.0 * jnp.pi) + jnp.log(k_raw + eps) + jnp.log1p(-k_raw + eps)
-            )
-            log_p += log_unif_kappa + log_jac_kappa
-            # h ~ Uniform(0, 1)
-            log_p += jnp.log(h_raw + eps) + jnp.log1p(-h_raw + eps)
-            # sigma ~ Uniform(-π/2, π/2) in physical space (range π).
-            # We parameterize via s_raw = sigmoid(us) and sigma = -π/2 + π*s_raw.
-            log_unif_sigma = -jnp.log(jnp.pi)
-            log_jac_sigma = (
-                jnp.log(jnp.pi) + jnp.log(s_raw + eps) + jnp.log1p(-s_raw + eps)
-            )
-            log_p += log_unif_sigma + log_jac_sigma
+            # kappa, h, and sigma are uniform in physical space, so only the
+            # Jacobian x(1 - x) remains: the range constants cancel.
+            for name in ("kappa", "h", "sigma"):
+                u = position[name]
+                log_p += jnn.log_sigmoid(u) + jnn.log_sigmoid(-u)
 
             # Prior for sigma_amp_ratio (HalfCauchy + Jacobian of softplus)
             if station_smooth_ar:
@@ -1349,8 +1331,8 @@ class InversionBlackJAX:
                 )
                 log_p += log_p_hc + jnn.log_sigmoid(u_ar)
 
-            log_p = jnp.clip(log_p, -1.0e3, 1.0e3)
-            return jnp.nan_to_num(log_p, nan=-1.0e3, posinf=1.0e3, neginf=-1.0e3)
+            # A NaN position must always be rejected, whatever the tails do.
+            return jnp.where(jnp.isnan(log_p), -jnp.inf, log_p)
 
         def loglikelihood_fn(position):
             """Combined log-likelihood for polarity and amplitude ratio."""
@@ -1811,7 +1793,6 @@ class InversionBlackJAX:
         smc_st = _get_smc_state(state)
         prev_beta = float(smc_st.tempering_param)
         stall_count = 0
-        tempering_stalled = False
         for iteration in range(self.max_smc_iterations):
             smc_st = _get_smc_state(state)
             if use_persistent:
@@ -1880,7 +1861,6 @@ class InversionBlackJAX:
             else:
                 stall_count = 0
             if stall_count >= self.tempering_stall_patience:
-                tempering_stalled = True
                 _emit_progress(
                     "SMC tempering stalled "
                     f"(delta_beta < {self.min_tempering_increment:.1e} for {stall_count} stages). "
@@ -1890,9 +1870,16 @@ class InversionBlackJAX:
 
         elapsed = time.time() - start_time
         smc_st = _get_smc_state(state)
-        _emit_progress(
-            f"SMC completed in {elapsed:.2f}s with beta={float(smc_st.tempering_param):.4f}"
-        )
+        final_beta = float(smc_st.tempering_param)
+        # The flag describes the samples returned, whichever limit stopped the
+        # run, matching the batched path.
+        tempering_stalled = final_beta < 1.0 - 1e-6
+        _emit_progress(f"SMC completed in {elapsed:.2f}s with beta={final_beta:.4f}")
+        if tempering_stalled:
+            _emit_progress(
+                f"WARNING: SMC stopped at beta={final_beta:.4f}, so these samples "
+                "are not the posterior."
+            )
 
         # --- Extract Results ---
         if use_persistent:
@@ -1968,6 +1955,7 @@ class InversionBlackJAX:
             sigma_amp_ratio_station=sigma_ar_station_s,
             sigma_amp_ratio_station_names=sigma_ar_station_names,
             tempering_stalled=tempering_stalled,
+            final_beta=final_beta,
         )
 
     def _extract_polarity_observations(self, data: DataDict) -> np.ndarray:

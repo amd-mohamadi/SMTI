@@ -517,43 +517,32 @@ def _make_model(
     def logprior_fn(position):
         log_p = 0.0
 
+        # log_sigmoid gives log(x) and log(1 - x) for x = sigmoid(u) without a
+        # floor, so the density keeps decaying in the tails and the target stays
+        # normalizable in unconstrained space.
         ug = position["gamma"]
         ud = position["delta"]
-        g_raw = jnn.sigmoid(ug)
-        d_raw = jnn.sigmoid(ud)
 
+        # Beta(a, b) on sigmoid(u) times the Jacobian x(1 - x). The linear map to
+        # physical gamma/delta only adds a constant, which is dropped.
         g_a, g_b = gamma_beta_prior
         d_a, d_b = delta_beta_prior
-        log_beta_g = (
-            (g_a - 1.0) * jnp.log(g_raw + _EPS)
-            + (g_b - 1.0) * jnp.log1p(-g_raw + _EPS)
+        log_p += (
+            g_a * jnn.log_sigmoid(ug)
+            + g_b * jnn.log_sigmoid(-ug)
             - jsp.special.betaln(g_a, g_b)
         )
-        log_beta_d = (
-            (d_a - 1.0) * jnp.log(d_raw + _EPS)
-            + (d_b - 1.0) * jnp.log1p(-d_raw + _EPS)
+        log_p += (
+            d_a * jnn.log_sigmoid(ud)
+            + d_b * jnn.log_sigmoid(-ud)
             - jsp.special.betaln(d_a, d_b)
         )
-        log_jac_g = jnp.log(g_raw + _EPS) + jnp.log1p(-g_raw + _EPS)
-        log_jac_d = jnp.log(d_raw + _EPS) + jnp.log1p(-d_raw + _EPS)
-        log_p += log_beta_g + log_jac_g
-        log_p += log_beta_d + log_jac_d
 
-        k_raw = jnn.sigmoid(position["kappa"])
-        h_raw = jnn.sigmoid(position["h"])
-        s_raw = jnn.sigmoid(position["sigma"])
-
-        log_unif_kappa = -jnp.log(2.0 * jnp.pi)
-        log_jac_kappa = (
-            jnp.log(2.0 * jnp.pi) + jnp.log(k_raw + _EPS) + jnp.log1p(-k_raw + _EPS)
-        )
-        log_p += log_unif_kappa + log_jac_kappa
-        log_p += jnp.log(h_raw + _EPS) + jnp.log1p(-h_raw + _EPS)
-        log_unif_sigma = -jnp.log(jnp.pi)
-        log_jac_sigma = (
-            jnp.log(jnp.pi) + jnp.log(s_raw + _EPS) + jnp.log1p(-s_raw + _EPS)
-        )
-        log_p += log_unif_sigma + log_jac_sigma
+        # kappa, h, and sigma are uniform in physical space, so only the Jacobian
+        # x(1 - x) remains: the range constants cancel.
+        for name in ("kappa", "h", "sigma"):
+            u = position[name]
+            log_p += jnn.log_sigmoid(u) + jnn.log_sigmoid(-u)
 
         if has_ar:
             u_ar = position["sigma_amp_ratio"]
@@ -566,8 +555,8 @@ def _make_model(
             )
             log_p += log_p_hc + jnn.log_sigmoid(u_ar)
 
-        log_p = jnp.clip(log_p, -1.0e3, 1.0e3)
-        return jnp.nan_to_num(log_p, nan=-1.0e3, posinf=1.0e3, neginf=-1.0e3)
+        # A NaN position must always be rejected, whatever the tails do.
+        return jnp.where(jnp.isnan(log_p), -jnp.inf, log_p)
 
     def loglikelihood_fn(position):
         params = unconstrained_to_params(position)
@@ -1114,6 +1103,7 @@ def _entry_result(
     b: int,
     stalled: bool,
     ln_p: Optional[np.ndarray] = None,
+    final_beta: Optional[float] = None,
 ):
     """Build one ``InversionResult`` from row ``b`` of a bucket's output."""
     gamma_s = np.asarray(params["gamma"][b], dtype=float)
@@ -1153,6 +1143,7 @@ def _entry_result(
         sigma_amp_ratio_station=None,
         sigma_amp_ratio_station_names=None,
         tempering_stalled=bool(stalled),
+        final_beta=final_beta,
     )
 
 
@@ -1355,6 +1346,7 @@ def run_batched(
                         b,
                         bool(out["stalled"][b]),
                         ln_p=out.get("ln_p"),
+                        final_beta=float(out["lambda"][b]),
                     ),
                 )
             )
