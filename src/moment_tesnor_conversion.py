@@ -534,9 +534,11 @@ def GD_basic_cdc(gamma_in, delta_in):
     poisson_den = 2 - term_B
     
     # Avoid division by zero if poisson_den is zero (i.e. term_B = 2)
+    safe_poisson_den = np.where(np.isclose(poisson_den, 0), 1.0, poisson_den)
     poisson = np.where(np.isclose(poisson_den, 0),
-                       np.sign(poisson_num) * np.inf if not np.isclose(poisson_num,0) else np.nan,
-                       poisson_num / poisson_den)
+                       np.where(np.isclose(poisson_num, 0), np.nan,
+                                np.sign(poisson_num) * np.inf),
+                       poisson_num / safe_poisson_den)
     
     if np.isscalar(gamma_in):
         return alpha.item(), poisson.item()

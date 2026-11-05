@@ -433,7 +433,10 @@ class InversionPyTensor:
                     sigma_pol = pt.as_tensor(error_pol_np)
                     sigma_pol = pt.maximum(sigma_pol, _SMALL_NUMBER)
                     
-                    # Incorrect polarity probability (scalar or N_obs,)
+                    # Incorrect polarity probability (scalar or N_obs,).
+                    # Experimental: zero by default (pure probit likelihood);
+                    # nonzero only when the input data carry an
+                    # IncorrectPolarityProbability field.
                     if isinstance(incorrect_prob, (float, int)):
                         inc_tensor = pt.as_tensor(float(incorrect_prob))
                     else:

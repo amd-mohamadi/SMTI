@@ -283,6 +283,8 @@ def _pad_event_arrays(
         # ``incorrect_prob`` is a python float for a global value and a
         # per-observation array otherwise; normalise to per-observation so a
         # bucket can mix the two.  The math is identical either way.
+        # Experimental: zero by default (pure probit likelihood); nonzero only
+        # when the input data carry an IncorrectPolarityProbability field.
         inc_raw = prep["incorrect_prob"]
         inc = np.zeros(n_pol, dtype=np.float64)
         inc[:n] = np.asarray(inc_raw, dtype=np.float64).reshape(-1)

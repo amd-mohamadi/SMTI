@@ -226,6 +226,9 @@ def polarity_matrix(
         Fractional uncertainty per observation, shape (N_obs,).
     incorrect_polarity_prob : np.ndarray or float
         Per-observation probability of polarity flip, or 0 if not provided.
+        Experimental: read from the optional ``IncorrectPolarityProbability``
+        field and zero by default, so the mixture term in the polarity
+        likelihood is disabled unless that field is supplied.
     """
     a = False
     _a = False
