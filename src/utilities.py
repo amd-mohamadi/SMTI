@@ -1615,6 +1615,172 @@ def _block_ess_rhat(
     return s_conv, ess_min, r_hat_max
 
 
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    """Weighted quantile, non-interpolated (202608_fit_quality_metric.md sec. 8).
+
+    Sort the values, accumulate the sorted weights, and return the first value
+    whose cumulative weight reaches the target fraction ``q`` in [0, 1].
+    """
+    values = np.asarray(values, dtype=float).reshape(-1)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    order = np.argsort(values)
+    v = values[order]
+    cumw = np.cumsum(weights[order])
+    if cumw[-1] <= 0.0:
+        return float(np.quantile(v, q))
+    idx = int(np.searchsorted(cumw, q * cumw[-1]))
+    return float(v[min(idx, v.size - 1)])
+
+
+def _deterministic_medoid_idx(
+    n: int,
+    weights: np.ndarray,
+    pairwise_deg,
+    n_candidates: int = 64,
+    n_targets: int = 512,
+) -> int:
+    """Pooled index of the sample minimising the weighted mean distance.
+
+    Candidate and target samples are deterministic evenly-spaced subsamples
+    (``np.linspace`` over indices) -- no RNG, reproducible.  ``pairwise_deg``
+    maps one candidate index and an index array to distances in degrees.
+    """
+    cand = np.unique(np.linspace(0, n - 1, min(n_candidates, n)).astype(int))
+    targ = np.unique(np.linspace(0, n - 1, min(n_targets, n)).astype(int))
+    w = np.asarray(weights, dtype=float).reshape(-1)[targ]
+    w_sum = float(np.sum(w))
+    if not np.isfinite(w_sum) or w_sum <= 0.0:
+        w = np.full(targ.size, 1.0 / targ.size)
+    else:
+        w = w / w_sum
+    best_idx, best_cost = int(cand[0]), np.inf
+    for c in cand:
+        cost = float(np.sum(w * pairwise_deg(int(c), targ)))
+        if cost < best_cost:
+            best_idx, best_cost = int(c), cost
+    return best_idx
+
+
+def mt_fit_quality_scores(
+    gamma: np.ndarray,
+    delta: np.ndarray,
+    kappa: np.ndarray,
+    h: np.ndarray,
+    sigma: np.ndarray,
+    weights: np.ndarray,
+    ref_idx: int,
+    idata=None,
+    dc: bool = False,
+    ess_target: float = 400.0,
+    q90_dc_good: float = 10.0,
+    q90_dc_bad: float = 60.0,
+    d_mm_dc_good: float = 5.0,
+    d_mm_dc_bad: float = 40.0,
+    q90_ndc_good: float = 5.0,
+    q90_ndc_bad: float = 45.0,
+    d_mm_ndc_good: float = 3.0,
+    d_mm_ndc_bad: float = 35.0,
+) -> dict:
+    """Revised clustering-free Qdc/Qndc (202608_fit_quality_metric.md).
+
+    Everything is a distance from the maximum-likelihood sample ``ref_idx``
+    (pooled flat index): weighted q50/q90 of the Kagan angle (DC block) and of
+    the great-circle lune distance (nDC block), plus the distance between the
+    maxlik sample and the block medoid (``d_mm``).  Convergence multiplies:
+
+        Qdc  = s_conv_dc  * (s(q90_dc)  + s(d_mm_dc))  / 2
+        Qndc = s_conv_ndc * (s(q90_ndc) + s(d_mm_ndc)) / 2
+
+    No GMM, no BIC, no merge threshold, no RNG.
+    """
+    kappa = np.asarray(kappa, dtype=float).reshape(-1)
+    h = np.asarray(h, dtype=float).reshape(-1)
+    sigma = np.asarray(sigma, dtype=float).reshape(-1)
+    gamma = np.asarray(gamma, dtype=float).reshape(-1)
+    delta = np.asarray(delta, dtype=float).reshape(-1)
+    n = kappa.size
+    ref_idx = int(ref_idx)
+
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    if w.size != n or not np.all(np.isfinite(w)) or np.sum(w) <= 0.0:
+        w = np.full(n, 1.0 / max(n, 1))
+    else:
+        w = w / np.sum(w)
+
+    out = {
+        "Qdc": float("nan"), "Qndc": float("nan"),
+        "q50_dc_deg": float("nan"), "q90_dc_deg": float("nan"),
+        "d_mm_dc_deg": float("nan"),
+        "q50_ndc_deg": float("nan"), "q90_ndc_deg": float("nan"),
+        "d_mm_ndc_deg": float("nan"),
+        "s_conv_dc": float("nan"), "s_conv_ndc": float("nan"),
+        "ess_min_dc": float("nan"), "ess_min_ndc": float("nan"),
+        "rhat_max_dc": float("nan"), "rhat_max_ndc": float("nan"),
+    }
+    if n == 0:
+        return out
+
+    # ---- DC block: Kagan angle about the maxlik orientation
+    ang_dc = kagan_angles_deg(
+        kappa[ref_idx], h[ref_idx], sigma[ref_idx], kappa, h, sigma
+    )
+    out["q50_dc_deg"] = _weighted_quantile(ang_dc, w, 0.50)
+    out["q90_dc_deg"] = _weighted_quantile(ang_dc, w, 0.90)
+
+    def _kagan_pairwise(c, targ):
+        return kagan_angles_deg(
+            kappa[c], h[c], sigma[c], kappa[targ], h[targ], sigma[targ]
+        )
+
+    med_dc = _deterministic_medoid_idx(n, w, _kagan_pairwise)
+    out["d_mm_dc_deg"] = float(ang_dc[med_dc])
+
+    s_conv_dc, ess_min_dc, rhat_max_dc = _block_ess_rhat(
+        idata, ("kappa", "h", "sigma"), ess_target=ess_target
+    )
+    out["s_conv_dc"] = float(s_conv_dc)
+    out["ess_min_dc"] = float(ess_min_dc)
+    out["rhat_max_dc"] = float(rhat_max_dc)
+    out["Qdc"] = float(
+        s_conv_dc
+        * 0.5
+        * (
+            _angle_quantile_score(out["q90_dc_deg"], q90_dc_good, q90_dc_bad)
+            + _angle_quantile_score(out["d_mm_dc_deg"], d_mm_dc_good, d_mm_dc_bad)
+        )
+    )
+
+    if dc:
+        return out
+
+    # ---- nDC block: lune distance about the maxlik source type
+    ang_ndc = lune_distance_deg(gamma[ref_idx], delta[ref_idx], gamma, delta)
+    out["q50_ndc_deg"] = _weighted_quantile(ang_ndc, w, 0.50)
+    out["q90_ndc_deg"] = _weighted_quantile(ang_ndc, w, 0.90)
+
+    def _lune_pairwise(c, targ):
+        return lune_distance_deg(gamma[c], delta[c], gamma[targ], delta[targ])
+
+    med_ndc = _deterministic_medoid_idx(n, w, _lune_pairwise)
+    out["d_mm_ndc_deg"] = float(ang_ndc[med_ndc])
+
+    s_conv_ndc, ess_min_ndc, rhat_max_ndc = _block_ess_rhat(
+        idata, ("gamma", "delta"), ess_target=ess_target
+    )
+    out["s_conv_ndc"] = float(s_conv_ndc)
+    out["ess_min_ndc"] = float(ess_min_ndc)
+    out["rhat_max_ndc"] = float(rhat_max_ndc)
+    out["Qndc"] = float(
+        s_conv_ndc
+        * 0.5
+        * (
+            _angle_quantile_score(out["q90_ndc_deg"], q90_ndc_good, q90_ndc_bad)
+            + _angle_quantile_score(out["d_mm_ndc_deg"], d_mm_ndc_good, d_mm_ndc_bad)
+        )
+    )
+    return out
+
+
 def mt_quality_scores_dc_ndc(
     gamma: np.ndarray,
     delta: np.ndarray,
